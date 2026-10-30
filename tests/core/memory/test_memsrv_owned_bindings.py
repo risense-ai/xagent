@@ -122,8 +122,32 @@ def test_owned_configured_agent_keeps_independent_identity_without_provider(
     ]
     assert all(call["headers"]["Authorization"] == f"Bearer {KEY}" for call in calls)
     assert not any("/org/" in call["url"] for call in calls)
+    assert calls[-1]["headers"]["X-Memory-Owner-Id"] == "202"
     store.search("ordinary user after scope")
     assert calls[-1]["headers"]["X-User-External-Id"] == "31"
+    assert "X-Memory-Owner-Id" not in calls[-1]["headers"]
+
+
+@pytest.mark.parametrize("operation", ["update", "delete"])
+def test_independent_scope_refuses_conflicting_explicit_owner_before_http(
+    owned: Any, operation: str
+) -> None:
+    from xagent.core.memory.core import MemoryNote
+
+    _engine, _record, _state, calls, store, check = owned
+    with delegated_agent_identity(7, store=store, owner_check=check):
+        answered = len(calls)
+        with pytest.raises(RemoteMemoryStoreError) as denied:
+            if operation == "update":
+                store.update(
+                    MemoryNote(id="synthetic-parent", content="blocked"), owner_id=101
+                )
+            else:
+                store.delete("synthetic-parent", owner_id=101)
+        assert denied.value.status_code == 403
+        assert len(calls) == answered
+        store.search("permitted operation still fixes independent owner")
+        assert calls[-1]["headers"]["X-Memory-Owner-Id"] == "202"
 
 
 @pytest.mark.parametrize("malformed_error", [True, False])

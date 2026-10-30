@@ -80,6 +80,8 @@ def runtime(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
             calls.append({"method": method, "url": url, **kwargs})
             actor = kwargs["headers"]["X-User-External-Id"]
             assert actor in {"31", "agent:7"}
+            if not url.endswith("/whoami") and state.get("data_handler") is not None:
+                return state["data_handler"](method, url, **kwargs)
             payload = (
                 {
                     "scopes": ["memory:read", "memory:write"],
@@ -126,6 +128,7 @@ def runtime(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     from xagent.core.agent import service
     from xagent.core.tools.adapters.vibe import agent_model_resolution
 
+    real_service = service.AgentService
     monkeypatch.setattr(service, "AgentService", RecordingService)
     monkeypatch.setattr(
         agent_model_resolution,
@@ -138,7 +141,12 @@ def runtime(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     token = current_user_id.set(999)
     try:
         yield SimpleNamespace(
-            engine=engine, factory=factory, calls=calls, store=store, state=state
+            engine=engine,
+            factory=factory,
+            calls=calls,
+            store=store,
+            state=state,
+            real_service=real_service,
         )
     finally:
         current_user_id.reset(token)
@@ -177,6 +185,178 @@ async def test_owned_binding_uses_independent_identity(
         "agent:7",
     ]
     assert not any("/org/" in call["url"] for call in runtime.calls)
+
+
+@pytest.mark.asyncio
+async def test_real_delegated_memory_tools_confine_inherited_acl_to_agent_owner(
+    runtime: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run actual AgentService/ReAct/tools/to_thread against synthetic HTTP.
+
+    memsrv agents inherit their person's ACL. Acting as agent:7 alone may
+    read/write the parent and sibling notes; its owner header narrows that
+    existing ACL server-side. No real LLM, service, or user content is used.
+    """
+    from xagent.core.agent import service
+    from xagent.core.tools.adapters.vibe import agent_model_resolution
+    from xagent.web.user_isolated_memory import UserContext
+
+    notes = {
+        "parent-note": {
+            "id": "parent-note",
+            "owner_id": 101,
+            "content": "SYNTHETIC_PARENT_PRIVATE",
+            "category": "react_memory",
+        },
+        "sibling-note": {
+            "id": "sibling-note",
+            "owner_id": 303,
+            "content": "SYNTHETIC_SIBLING_PRIVATE",
+            "category": "react_memory",
+        },
+        "company-note": {
+            "id": "company-note",
+            "owner_id": 404,
+            "content": "SYNTHETIC_COMPANY_SHARED",
+            "category": "react_memory",
+            "space_kind": "company",
+        },
+    }
+    original_notes = json.loads(json.dumps(notes))
+
+    def respond(status: int, payload: Any) -> requests.Response:
+        response = requests.Response()
+        response.status_code = status
+        response._content = json.dumps(payload).encode()
+        return response
+
+    def memory_http(method: str, url: str, **kwargs: Any) -> requests.Response:
+        headers = kwargs["headers"]
+        selected = headers.get("X-Memory-Owner-Id")
+        # Mirrors memsrv owner(): explicit selection intersects the derived
+        # inherited ACL and narrows both reads and writes, clearing spaces.
+        owners = {101, 202, 303, 404} if selected is None else {int(selected)}
+        body = kwargs.get("json") or {}
+        if url.endswith("/search"):
+            category = (body.get("filters") or {}).get("category")
+            hits = [
+                dict(note)
+                for note in notes.values()
+                if note["owner_id"] in owners
+                and (category is None or note["category"] == category)
+            ]
+            return respond(200, {"results": hits[: body.get("k", 5)]})
+        if method == "POST" and url.endswith("/notes"):
+            note = {**body, "id": "agent-note", "owner_id": int(selected or 202)}
+            notes["agent-note"] = note
+            return respond(200, {"id": "agent-note", "success": True})
+        note_id = url.rsplit("/", 1)[-1]
+        note = notes.get(note_id)
+        if note is None or note["owner_id"] not in owners:
+            return respond(404, {"error": "not found"})
+        if method == "GET":
+            return respond(200, note)
+        if method == "PATCH":
+            note.update(body)
+            return respond(
+                200, {"id": note_id, "success": True, "owner_id": note["owner_id"]}
+            )
+        assert method == "DELETE"
+        del notes[note_id]
+        return respond(200, {"id": note_id, "success": True})
+
+    runtime.state["data_handler"] = memory_http
+    commands = [
+        ("store_memory", {"content": "Synthetic agent prefers teal reports."}),
+        ("search_memory", {"query": "synthetic preference"}),
+        ("update_memory", {"memory_id": "parent-note", "content": "forbidden"}),
+        ("delete_memory", {"memory_id": "parent-note"}),
+        ("update_memory", {"memory_id": "sibling-note", "content": "forbidden"}),
+        ("delete_memory", {"memory_id": "sibling-note"}),
+        (
+            "update_memory",
+            {
+                "memory_id": "agent-note",
+                "content": "Synthetic updated teal preference.",
+            },
+        ),
+        ("search_memory", {"query": "synthetic updated preference"}),
+        ("delete_memory", {"memory_id": "agent-note"}),
+    ]
+
+    class ScriptedLLM:
+        model_name = "synthetic-no-network"
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            self.calls.append(str(kwargs))
+            index = len(self.calls) - 1
+            if index >= len(commands):
+                return {"content": "synthetic answer", "done": True}
+            name, arguments = commands[index]
+            return {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": f"synthetic-{index}",
+                        "function": {"name": name, "arguments": json.dumps(arguments)},
+                    }
+                ],
+                "done": False,
+            }
+
+    llm = ScriptedLLM()
+
+    class ActualService(runtime.real_service):
+        def __init__(self, **kwargs: Any) -> None:
+            kwargs.update(
+                tools=[],
+                tool_config=None,
+                enable_workspace=False,
+                enable_default_tools=False,
+                skills_enabled=False,
+            )
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(service, "AgentService", ActualService)
+    monkeypatch.setattr(
+        agent_model_resolution,
+        "resolve_agent_model_llms",
+        lambda *_args: (llm, None, None, None),
+    )
+    result = await _run(runtime, monkeypatch)
+    assert result == {"response": "synthetic answer"}
+    assert len(llm.calls) == len(commands) + 1
+    transcript = "\n".join(llm.calls)
+    assert "SYNTHETIC_PARENT_PRIVATE" not in transcript
+    assert "SYNTHETIC_SIBLING_PRIVATE" not in transcript
+    assert "SYNTHETIC_COMPANY_SHARED" not in transcript
+    assert "Synthetic updated teal preference." in transcript
+    assert "'stored': True" in transcript or '"stored": true' in transcript
+    assert notes == original_notes  # only the created agent note was deleted
+    data_calls = [call for call in runtime.calls if not call["url"].endswith("/whoami")]
+    assert data_calls
+    assert all(
+        call["headers"]["X-User-External-Id"] == "agent:7" for call in data_calls
+    )
+    assert all(call["headers"]["X-Memory-Owner-Id"] == "202" for call in data_calls)
+    assert any(call["method"] == "PATCH" for call in data_calls)
+    assert any(call["method"] == "DELETE" for call in data_calls)
+    assert (
+        sum(
+            call["method"] == "POST" and call["url"].endswith("/notes")
+            for call in data_calls
+        )
+        == 1
+    )
+    assert sum(call["method"] == "PATCH" for call in data_calls) == 1
+    assert sum(call["method"] == "DELETE" for call in data_calls) == 1
+    with UserContext(31):
+        runtime.store.search("ordinary parent after delegation")
+    assert runtime.calls[-1]["headers"]["X-User-External-Id"] == "31"
+    assert "X-Memory-Owner-Id" not in runtime.calls[-1]["headers"]
 
 
 @pytest.mark.asyncio

@@ -1027,7 +1027,10 @@ class RemoteMemoryStore(MemoryStore):
         The service key authenticates the process; ``X-User-External-Id``
         carries the acting xagent user so the service can resolve ownership.
         Inside :func:`delegated_agent_identity` the header carries the seat
-        identity (``agent:<ref>``) instead. A missing trusted user id raises
+        identity (``agent:<ref>``) instead. The separate owner selector fixes
+        its memory namespace: agent ACLs can otherwise include the parent's
+        records, even when the acting identity is the independent seat.
+        A missing trusted user id raises
         before any HTTP, including when a seat override exists.
         """
         headers = {
@@ -1037,7 +1040,16 @@ class RemoteMemoryStore(MemoryStore):
         }
         headers["X-User-External-Id"] = self.validate_identity_context()
         explicit_owner = _explicit_owner_override.get()
-        if explicit_owner is not None:
+        binding = _agent_identity_override.get()
+        if isinstance(binding, _ConfiguredAgentIdentityBinding):
+            owner_id = binding.mapping.memory_agent_id
+            if explicit_owner is not None and explicit_owner != owner_id:
+                raise RemoteMemoryStoreError(
+                    "Independent agent memory cannot select another owner",
+                    status_code=403,
+                )
+            headers[OWNER_HEADER] = str(owner_id)
+        elif explicit_owner is not None:
             headers[OWNER_HEADER] = str(explicit_owner)
         return headers
 
