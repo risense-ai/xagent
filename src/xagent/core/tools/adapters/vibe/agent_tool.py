@@ -1961,12 +1961,16 @@ def _resolve_delegated_parent_memory(
             resolve_trusted_memory_policy,
         )
 
+        # Preserve the server-bound parent ingress for host policy decisions.
+        # Delegation is an execution mechanism, not a new task origin. An
+        # unbound service call has no known origin and must remain explicit.
+        parent_call = current_tool_call_execution_context()
         host_policy = resolve_trusted_memory_policy(
             MemoryPolicyRequest(
                 task_id=task_id,
                 user_id=user_id,
                 agent_id=agent_id,
-                source="agent_tool",
+                source=parent_call.task_source if parent_call is not None else None,
                 is_preview=False,
             ),
             use_remote_default=False,

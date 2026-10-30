@@ -267,8 +267,17 @@ async def test_failed_readiness_disables_memory_with_reason(
 
 
 @pytest.mark.parametrize("policy_kind", ["disabled", "fixed", "failed"])
-def test_delegated_memory_honors_trusted_host_policy(runtime, policy_kind):
+@pytest.mark.parametrize("parent_source", [None, "internal", "sdk", "trigger"])
+def test_delegated_memory_honors_trusted_host_policy(
+    runtime, policy_kind, parent_source
+):
+    from contextlib import nullcontext
+
     from xagent.core.memory.access_scope import MemoryAccessScope
+    from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
+        ToolCallExecutionContext,
+        bind_tool_call_execution_context,
+    )
     from xagent.web.services.memory_policy import (
         MemoryPolicyDecision,
         set_trusted_memory_policy_resolver,
@@ -276,7 +285,7 @@ def test_delegated_memory_honors_trusted_host_policy(runtime, policy_kind):
     from xagent.web.user_isolated_memory import UserContext
 
     def policy(request):
-        assert request.source == "agent_tool"
+        assert request.source == parent_source
         if request.task_id != 17:
             return MemoryPolicyDecision(True, True)
         assert request.user_id == 31 and request.agent_id == 7
@@ -292,7 +301,22 @@ def test_delegated_memory_honors_trusted_host_policy(runtime, policy_kind):
 
     set_trusted_memory_policy_resolver(policy)
     try:
-        with UserContext(31):
+        parent_context = (
+            nullcontext()
+            if parent_source is None
+            else bind_tool_call_execution_context(
+                ToolCallExecutionContext(
+                    task_source=parent_source,
+                    task_id="17",
+                    run_id="synthetic-run",
+                    turn_id="synthetic-turn",
+                    tool_call_id="synthetic-call",
+                    pattern="react",
+                    react_step_id="synthetic-step",
+                )
+            )
+        )
+        with UserContext(31), parent_context:
             store, _available, reason = module._resolve_delegated_parent_memory(
                 user_id=31, agent_id=7, task_id=17
             )
