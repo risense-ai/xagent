@@ -1944,7 +1944,7 @@ def _resolve_delegated_parent_memory(
     from .....config import get_memory_backend
 
     if get_memory_backend() != "remote":
-        return None, False, "delegated_memory_disabled"
+        return None, True, None
     try:
         from .....core.memory.remote import (
             RemoteMemoryStoreIdentityError,
@@ -2710,10 +2710,12 @@ class AgentTool(AbstractBaseTool):
                 )
 
                 delegated_memory = None
-                delegated_memory_available = False
-                delegated_memory_reason: str | None = "delegated_memory_disabled"
+                delegated_memory_available = True
+                delegated_memory_reason: str | None = None
                 owner_check = None
                 if get_memory_backend() == "remote":
+                    delegated_memory_available = False
+                    delegated_memory_reason = "delegated_memory_unavailable"
                     from .....core.memory.remote import RemoteMemoryStoreIdentityError
 
                     try:

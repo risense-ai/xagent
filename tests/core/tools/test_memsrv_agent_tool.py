@@ -220,6 +220,8 @@ async def test_local_backend_keeps_one_shot_memory_disabled(
     assert await _run(runtime, monkeypatch) == {"response": "synthetic answer"}
     child = runtime.state["constructed"][0]
     assert not child["memory_enabled"] and child["memory"] is None
+    assert child["memory_available"] is True
+    assert child["memory_availability_reason"] is None
     assert runtime.state["probes"] == []
     assert runtime.calls == []
 
