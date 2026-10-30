@@ -30,6 +30,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
+from ..config import get_memory_backend
 from ..core.memory import (
     DormantLanceDBMemoryHandle,
     MemoryStorageCapabilities,
@@ -38,10 +39,19 @@ from ..core.memory import (
     StorageAdmissionState,
     admit_lancedb_memory_storage,
 )
+from ..core.memory.base import MemoryStore
 from ..core.memory.lancedb import LanceDBMemoryStore
 from ..core.memory.lancedb_maintenance import (
     DEFAULT_LOCK_TIMEOUT,
     validate_lock_timeout,
+)
+from ..core.memory.remote import (
+    RemoteMemoryReadiness,
+    RemoteMemoryStoreConfigurationError,
+    RemoteMemoryStoreIdentityError,
+    remote_memory_readiness,
+    remote_memory_store_from_config,
+    require_remote_memory_identity,
 )
 from ..core.memory.vector_compatibility import (
     canonical_embedding_identity,
@@ -57,6 +67,7 @@ from .services.global_memory_embedding_authority import (
     AuthorityCredentialUnavailable,
     GlobalMemoryEmbeddingAuthoritySnapshot,
 )
+from .services.memory_policy import MemoryPolicyDecision, MemoryPolicyRequest
 from .user_isolated_memory import UserIsolatedMemoryStore
 
 logger = logging.getLogger(__name__)
@@ -178,6 +189,8 @@ class MemoryLifecycleStatus:
     state: MemoryLifecycleState
     mode: Optional[MemoryStorageMode] = None
     vector_search: bool = False
+    remote_status: str | None = None
+    reason: str | None = None
 
     @property
     def detail(self) -> str:
@@ -202,7 +215,7 @@ class AdmissionResult:
     """
 
     status: MemoryLifecycleStatus
-    store: Optional[UserIsolatedMemoryStore] = None
+    store: Optional[MemoryStore] = None
     vector_space_fingerprint: Optional[str] = None
 
 
@@ -303,6 +316,79 @@ def _admit_once(
         identity,
         writers_quiesced=writers_quiesced,
         lock_timeout=lock_timeout,
+    )
+
+
+def remote_admission_result() -> AdmissionResult | None:
+    """Publish a configured remote adapter without local vector admission.
+
+    Construction performs no I/O. An incomplete remote configuration fences
+    memory instead of silently falling back to local or ephemeral storage.
+    """
+    backend = get_memory_backend()
+    if backend in {"", "local"}:
+        return None
+    if backend != "remote":
+        logger.error("Unknown memory backend; memory remains unavailable")
+        return AdmissionResult(
+            MemoryLifecycleStatus(MemoryLifecycleState.RESTART_REQUIRED)
+        )
+    try:
+        store = remote_memory_store_from_config()
+    except RemoteMemoryStoreConfigurationError:
+        logger.error(
+            "Remote memory configuration is incomplete; restart after fixing it"
+        )
+        return AdmissionResult(
+            MemoryLifecycleStatus(MemoryLifecycleState.RESTART_REQUIRED)
+        )
+    return AdmissionResult(
+        MemoryLifecycleStatus(MemoryLifecycleState.READY, remote_status="unknown"),
+        store=store,
+    )
+
+
+def remote_lifecycle_status(health: RemoteMemoryReadiness) -> MemoryLifecycleStatus:
+    """Report dependency health separately from the configured publication."""
+    return MemoryLifecycleStatus(
+        MemoryLifecycleState.READY
+        if health.available
+        else MemoryLifecycleState.RETRYABLE_UNAVAILABLE,
+        mode=(
+            MemoryStorageMode.VECTOR
+            if health.semantic_available
+            else MemoryStorageMode.TEXT_ONLY
+        )
+        if health.available
+        else None,
+        vector_search=health.semantic_available,
+        remote_status=health.status,
+        reason=health.reason,
+    )
+
+
+def resolve_remote_memory_policy(request: MemoryPolicyRequest) -> MemoryPolicyDecision:
+    """Default remote eligibility; health is never an identity grant."""
+    if request.is_preview or request.agent_id is not None:
+        return MemoryPolicyDecision(enabled=False, available=True)
+    try:
+        require_remote_memory_identity(request.user_id)
+        # Validate the active scope as well as the request projection before
+        # readiness I/O. In particular, a previously revoked scope stays closed.
+        from .dynamic_memory_store import get_memory_store
+        from .revocable_memory_store import unwrap_memory_store
+
+        store = unwrap_memory_store(get_memory_store())
+        store.validate_identity_context()
+    except RemoteMemoryStoreIdentityError as error:
+        return MemoryPolicyDecision(enabled=False, available=False, reason=str(error))
+    health = remote_memory_readiness()
+    return MemoryPolicyDecision(
+        enabled=health.available,
+        available=health.available,
+        reason=health.reason,
+        remote_status=health.status,
+        semantic_available=health.semantic_available,
     )
 
 
@@ -466,4 +552,7 @@ __all__ = [
     "default_similarity_threshold",
     "log_operator_guidance",
     "memory_store_dir",
+    "remote_admission_result",
+    "remote_lifecycle_status",
+    "resolve_remote_memory_policy",
 ]

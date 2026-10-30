@@ -40,6 +40,8 @@ class MemoryPolicyDecision:
     available: bool
     reason: str | None = None
     memory_access_scope: MemoryAccessScope | None = None
+    remote_status: str | None = None
+    semantic_available: bool | None = None
 
 
 MemoryPolicyResolver = Callable[[MemoryPolicyRequest], MemoryPolicyDecision]
@@ -60,12 +62,24 @@ def set_trusted_memory_policy_resolver(
 
 def resolve_trusted_memory_policy(
     request: MemoryPolicyRequest,
+    *,
+    use_remote_default: bool = True,
 ) -> MemoryPolicyDecision | None:
     """Resolve a host override, failing closed on errors or invalid decisions."""
 
     resolver = _trusted_memory_policy_resolver
     if resolver is None:
-        return None
+        if not use_remote_default:
+            return None
+        # The remote backend supplies a default, without replacing a resolver
+        # installed by the trusted host (including its fixed access scope).
+        from ...config import get_memory_backend
+
+        if get_memory_backend() != "remote":
+            return None
+        from ..memory_lifecycle import resolve_remote_memory_policy
+
+        resolver = resolve_remote_memory_policy
 
     try:
         decision = resolver(request)
@@ -85,6 +99,30 @@ def _validate_decision(decision: object) -> None:
         raise TypeError("memory policy resolver returned an invalid decision type")
     if type(decision.enabled) is not bool or type(decision.available) is not bool:
         raise TypeError("memory policy decision flags must be bool")
+    if decision.remote_status is not None:
+        if decision.remote_status not in {
+            "ready",
+            "degraded",
+            "unavailable",
+            "protocol_error",
+        }:
+            raise TypeError("invalid remote memory status")
+        usable = decision.remote_status in {"ready", "degraded"}
+        semantic = decision.remote_status == "ready"
+        if (
+            decision.available is not usable
+            or decision.semantic_available is not semantic
+        ):
+            raise ValueError("remote memory state contradicts declared capabilities")
+        if decision.remote_status == "degraded" and decision.reason is None:
+            raise ValueError("degraded memory requires a reason")
+    if (
+        decision.semantic_available is not None
+        and type(decision.semantic_available) is not bool
+    ):
+        raise TypeError("semantic availability must be bool")
+    if decision.semantic_available is True and not decision.available:
+        raise ValueError("unavailable memory cannot provide semantic retrieval")
     if decision.enabled and not decision.available:
         raise ValueError("unavailable memory cannot be enabled")
     if decision.reason is not None and (

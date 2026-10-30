@@ -11,6 +11,7 @@ from starlette import convertors as starlette_url  # codespell:ignore
 
 from xagent.core.memory.base import MemoryStore
 from xagent.core.memory.core import MemoryNote
+from xagent.core.memory.remote import RemoteMemoryStoreError
 
 from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store, get_memory_store_manager
@@ -84,6 +85,16 @@ def memory_operation() -> Iterator[None]:
         yield
     except MemoryUnavailableError as error:
         raise HTTPException(status_code=503, detail=error.status.detail) from None
+    except RemoteMemoryStoreError as error:
+        # A dependency failure (including an incomplete list) must never look
+        # like a successful operation. Only the service's conflict is public
+        # business state; other failures keep credentials and upstream details
+        # behind the same stable unavailable response used by memory reads.
+        if error.status_code == 409:
+            raise HTTPException(status_code=409, detail=str(error)) from None
+        raise HTTPException(
+            status_code=503, detail=MEMORY_READ_UNAVAILABLE_DETAIL
+        ) from None
 
 
 class MemoryListRequest(BaseModel):
@@ -442,9 +453,14 @@ class MemoryManagementRouter:
                 # request-scoped connection is still held, so on a
                 # single-slot pool the nested checkout would be waiting on
                 # the very thread that has to release it.
-                return await run_db_io_cancellation_safe(
-                    get_memory_store_manager().get_store_info
-                )
+                with UserContext(int(user.id)):
+                    return await run_db_io_cancellation_safe(
+                        get_memory_store_manager().get_store_info
+                    )
+            except RemoteMemoryStoreError:
+                raise HTTPException(
+                    status_code=503, detail=MEMORY_READ_UNAVAILABLE_DETAIL
+                ) from None
             except Exception:
                 logger.exception("Failed to read memory store info")
                 raise HTTPException(
