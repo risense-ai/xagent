@@ -4746,7 +4746,7 @@ def test_memsrv_service_and_identity_config(monkeypatch):
     [
         ("", True),
         (" ", True),
-        ("tru", True),
+        ("invalid", True),
         ("enabled", True),
         ("true", True),
         ("false", False),
