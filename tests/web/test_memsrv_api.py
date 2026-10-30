@@ -236,3 +236,43 @@ def test_local_memory_crud_remains_available() -> None:
         )
         assert client.delete(f"/api/memory/{note_id}").status_code == 200
         assert client.get(f"/api/memory/{note_id}").status_code == 404
+
+
+@pytest.mark.parametrize("search", [None, "synthetic query"])
+def test_web_date_filters_use_real_requests_json_encoding(search: str | None) -> None:
+    from datetime import datetime
+
+    class WireSession(requests.Session):
+        def __init__(self) -> None:
+            super().__init__()
+            self.sent: list[requests.PreparedRequest] = []
+
+        def send(
+            self, request: requests.PreparedRequest, **kwargs: Any
+        ) -> requests.Response:
+            self.sent.append(request)
+            response = requests.Response()
+            response.status_code = 200
+            response._content = b'{"results":[],"truncated":false}'
+            return response
+
+    session = WireSession()
+    store = RemoteMemoryStore("http://memsrv.invalid", "fixture", session=session)
+    params = {
+        "date_from": "2026-10-30T09:15:00+08:00",
+        "date_to": "2026-10-31T00:00:00Z",
+    }
+    if search:
+        params["search"] = search
+    with make_client(store) as client:
+        response = client.get("/api/memory/list", params=params)
+    assert response.status_code == 200
+    assert response.json()["total_count"] == 0
+    assert len(session.sent) == 1
+    assert session.sent[0].headers["X-User-External-Id"] == str(USER_ID)
+    filters = json.loads(session.sent[0].body)["filters"]
+    for key in ("date_from", "date_to"):
+        assert (
+            datetime.fromisoformat(filters[key]).timestamp()
+            == datetime.fromisoformat(params[key]).timestamp()
+        )

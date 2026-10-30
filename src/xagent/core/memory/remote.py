@@ -1206,6 +1206,13 @@ class RemoteMemoryStore(MemoryStore):
         """
         scope = self._memory_scope()
         merged = dict(filters) if filters else {}
+        # The MemoryStore API accepts datetime boundaries; memsrv's JSON
+        # contract requires strings. Include the offset so the instant does
+        # not depend on the service process's local timezone.
+        for key in ("date_from", "date_to"):
+            boundary = merged.get(key)
+            if isinstance(boundary, datetime):
+                merged[key] = boundary.astimezone().isoformat()
         wants_dimensions = bool(merged.pop(SCOPE_DIMENSIONS_FILTER_KEY, False))
         dimension_metadata = (
             memory_dimension_metadata(scope)
