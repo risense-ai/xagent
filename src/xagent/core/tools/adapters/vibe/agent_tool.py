@@ -3,6 +3,7 @@ Agent Tool - Convert published agents into callable tools
 """
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Optional, Type, cast
@@ -1929,6 +1930,117 @@ def _classify_delegated_child_failure(
     return None
 
 
+def _resolve_delegated_parent_memory(
+    *,
+    user_id: int | None = None,
+    agent_id: int | None = None,
+    task_id: int | None = None,
+) -> tuple[Any | None, bool, str | None]:
+    """Enable persistent delegated memory only for the selected remote backend.
+
+    Mapping and caller identity are checked before health probes or store
+    acquisition. A missing capability leaves this one-shot child memory off.
+    """
+    from .....config import get_memory_backend
+
+    if get_memory_backend() != "remote":
+        return None, False, "delegated_memory_disabled"
+    try:
+        from .....core.memory.remote import (
+            RemoteMemoryStoreIdentityError,
+            remote_memory_ready,
+            require_delegated_memory_identity,
+        )
+
+        try:
+            require_delegated_memory_identity(agent_id, user_id=user_id)
+        except RemoteMemoryStoreIdentityError as error:
+            return None, False, str(error)
+        from .....web.services.memory_policy import (
+            MemoryPolicyRequest,
+            resolve_trusted_memory_policy,
+        )
+
+        host_policy = resolve_trusted_memory_policy(
+            MemoryPolicyRequest(
+                task_id=task_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                source="agent_tool",
+                is_preview=False,
+            ),
+            use_remote_default=False,
+        )
+        if host_policy is not None:
+            if not host_policy.enabled or not host_policy.available:
+                return (
+                    None,
+                    host_policy.available,
+                    host_policy.reason or "delegated_memory_disabled",
+                )
+            if host_policy.memory_access_scope is not None:
+                # A fixed native namespace cannot be replaced by an agent's
+                # physical store. This composition has no supported selector.
+                return None, False, "delegated_memory_fixed_scope_unsupported"
+        available, reason = remote_memory_ready()
+        if not available:
+            return None, False, reason or "delegated_memory_unavailable"
+        from .....web.dynamic_memory_store import get_memory_store
+
+        return get_memory_store(), True, reason
+    except Exception:  # noqa: BLE001 - optional remote memory fails closed
+        logger.warning("Delegated remote memory could not be resolved")
+        return None, False, "delegated_memory_unavailable"
+
+
+def _agent_memory_ownership_check(
+    user_id: int, agent_id: int, session_factory: Any
+) -> Callable[[], None]:
+    """Check personal ownership afresh; execution visibility grants no memory.
+
+    A failed or unverifiable check permanently invalidates this guard, even
+    when the same database records or ambient identity are restored later.
+    """
+    invalidated = False
+
+    def check() -> None:
+        nonlocal invalidated
+        from .....core.memory.remote import (
+            RemoteMemoryStoreIdentityError,
+            require_remote_memory_identity,
+        )
+        from .....web.models.agent import Agent
+        from .....web.models.user import User
+        from .db_session import tool_session_scope
+
+        try:
+            if invalidated or require_remote_memory_identity() != str(user_id):
+                raise ValueError("agent memory owner changed")
+            with tool_session_scope(session_factory) as db:
+                user = db.query(User.id).filter(User.id == user_id).first()
+                agent = (
+                    db.query(Agent.user_id, Agent.status)
+                    .filter(Agent.id == agent_id)
+                    .first()
+                )
+                if (
+                    user is None
+                    or agent is None
+                    or type(agent.user_id) is not int
+                    or agent.user_id != user_id
+                    or getattr(agent.status, "value", agent.status)
+                    not in {"draft", "published"}
+                ):
+                    raise ValueError("agent memory is not personally owned")
+        except Exception:  # noqa: BLE001 - ownership failures must fail closed
+            invalidated = True
+            raise RemoteMemoryStoreIdentityError(
+                "agent_memory_ownership_required"
+            ) from None
+
+    return check
+
+
 class AgentTool(AbstractBaseTool):
     """
     Tool that wraps a published agent for execution.
@@ -2588,21 +2700,52 @@ class AgentTool(AbstractBaseTool):
                     parent_db_task_id=parent_db_task_id,
                 )
 
-                # Create agent service. Memory stays disabled for sub-agent
-                # runs: these are stateless one-shot executors, and any store
-                # we hand them here would be discarded when the call returns —
-                # the memory tools would report success while the note
-                # silently evaporates (the pre-tool pipeline had the same
-                # flaw, writing its end-of-run evaluation into a throwaway
-                # InMemoryMemoryStore). Wire the parent's real store through
-                # deliberately if sub-agent memory is ever wanted.
+                # Only the persistent remote backend supports delegated memory.
+                # Team visibility still permits execution above, but personal
+                # memory additionally requires fresh ownership and a trusted
+                # mapping. There is no parent-identity fallback on rejection.
+                from .....config import (
+                    get_memory_agent_seats_enabled,
+                    get_memory_backend,
+                )
+
+                delegated_memory = None
+                delegated_memory_available = False
+                delegated_memory_reason: str | None = "delegated_memory_disabled"
+                owner_check = None
+                if get_memory_backend() == "remote":
+                    from .....core.memory.remote import RemoteMemoryStoreIdentityError
+
+                    try:
+                        with UserContext(self._user_id):
+                            if get_memory_agent_seats_enabled():
+                                owner_check = _agent_memory_ownership_check(
+                                    self._user_id,
+                                    self._agent_id,
+                                    self._session_factory,
+                                )
+                                owner_check()
+                            (
+                                delegated_memory,
+                                delegated_memory_available,
+                                delegated_memory_reason,
+                            ) = _resolve_delegated_parent_memory(
+                                user_id=self._user_id,
+                                agent_id=self._agent_id,
+                                task_id=parent_db_task_id,
+                            )
+                    except RemoteMemoryStoreIdentityError as error:
+                        delegated_memory_reason = str(error)
                 agent_service = AgentService(
                     name=agent_name,
                     llm=default_llm,
                     fast_llm=fast_llm,
                     vision_llm=vision_llm,
                     compact_llm=compact_llm,
-                    memory_enabled=False,
+                    memory=delegated_memory,
+                    memory_enabled=delegated_memory is not None,
+                    memory_available=delegated_memory_available,
+                    memory_availability_reason=delegated_memory_reason,
                     # One-shot delegated calls cannot forward or resume a
                     # user interaction. Keep failures available to the child
                     # for reporting instead of parking an unreachable run.
@@ -2643,7 +2786,16 @@ class AgentTool(AbstractBaseTool):
                     if self._execution_scope is not None
                     else nullcontext()
                 )
-                with UserContext(self._user_id), scope_context:
+                identity_context: Any = nullcontext()
+                if delegated_memory is not None:
+                    from .....core.memory.remote import delegated_agent_identity
+
+                    identity_context = delegated_agent_identity(
+                        self._agent_id,
+                        store=delegated_memory,
+                        owner_check=owner_check,
+                    )
+                with UserContext(self._user_id), scope_context, identity_context:
                     result = await agent_service.execute_task(
                         task=args["task"],
                         context=execution_context if execution_context else None,

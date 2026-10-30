@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from ...config import (
     get_external_upload_dirs,
+    get_memory_backend,
     get_shared_task_execution_enabled,
 )
 from ...core.agent.context.memory_retrieval import (
@@ -37,6 +38,12 @@ from ...core.memory.access_scope import (
 )
 from ...core.memory.base import MemoryStore
 from ...core.memory.in_memory import InMemoryMemoryStore
+from ...core.memory.remote import (
+    RemoteMemoryStore,
+    RemoteMemoryStoreIdentityError,
+    remote_memory_readiness,
+    require_remote_memory_identity,
+)
 from ...core.model.chat.basic.adapter import attach_chat_retry_wrapper
 from ...core.model.chat.basic.base import BaseLLM
 from ...core.model.chat.basic.deepseek import DeepSeekLLM
@@ -67,6 +74,7 @@ from ..models.database import (
 from ..models.model import Model as DBModel
 from ..models.task import Task, TaskStatus
 from ..models.user import User
+from ..revocable_memory_store import unwrap_memory_store
 from ..sandbox_keys import (
     USER_LIFECYCLE_TYPE,
     make_user_lifecycle_id,
@@ -105,15 +113,13 @@ from .memory_availability import (
 from .memory_availability import (
     MEMORY_AVAILABILITY_REASON_METADATA_KEY,
     MEMORY_AVAILABLE_METADATA_KEY,
+    public_memory_availability_reason,
 )
 from .memory_availability import (
     PUBLIC_MEMORY_AVAILABILITY_REASONS as PUBLIC_MEMORY_AVAILABILITY_REASONS,
 )
 from .memory_availability import (
     caller_facing_execution_metadata as caller_facing_execution_metadata,
-)
-from .memory_availability import (
-    public_memory_availability_reason,
 )
 from .memory_policy import (
     MEMORY_POLICY_BINDING_FAILURE_REASON,
@@ -248,6 +254,8 @@ class AgentServiceMemoryPolicy:
     memory_available: bool = True
     memory_availability_reason: str | None = None
     memory_access_scope: MemoryAccessScope | None = None
+    memory_remote_status: str | None = None
+    memory_semantic_available: bool | None = None
 
     @property
     def public_availability_reason(self) -> str | None:
@@ -271,6 +279,10 @@ class AgentServiceMemoryPolicy:
         policy object for operator logging only.
         """
         metadata: dict[str, Any] = {}
+        if self.memory_remote_status is not None:
+            metadata["memory_remote_status"] = self.memory_remote_status
+        if self.memory_semantic_available is not None:
+            metadata["memory_semantic_available"] = self.memory_semantic_available
         if (
             ambient_owner_user_id is not _MEMORY_METADATA_INPUT_UNSET
             and ambient_execution_scope is not _MEMORY_METADATA_INPUT_UNSET
@@ -332,8 +344,10 @@ def resolve_agent_service_memory_policy(
         )
     )
     enabled = default_enabled if override is None else override.enabled
-    use_in_memory = (is_preview and not enabled) or (
-        override is not None and not override.available
+    use_in_memory = (
+        (is_preview and not enabled)
+        or (get_memory_backend() == "remote" and not enabled)
+        or (override is not None and not override.available)
     )
     if use_in_memory:
         if override is not None and not override.available:
@@ -346,6 +360,10 @@ def resolve_agent_service_memory_policy(
             memory_enabled=enabled,
             memory_available=True if override is None else override.available,
             memory_availability_reason=None if override is None else override.reason,
+            memory_remote_status=None if override is None else override.remote_status,
+            memory_semantic_available=None
+            if override is None
+            else override.semantic_available,
         )
 
     try:
@@ -369,6 +387,11 @@ def resolve_agent_service_memory_policy(
     access_scope = override.memory_access_scope if override is not None else None
     if access_scope is not None:
         try:
+            if (
+                isinstance(unwrap_memory_store(memory), RemoteMemoryStore)
+                and str(access_scope.owner_user_id) != require_remote_memory_identity()
+            ):
+                raise RemoteMemoryStoreIdentityError("memory_scope_owner_mismatch")
             memory = bind_memory_access_scope(memory, access_scope)
         except Exception:
             logger.warning("Trusted memory access-scope binding failed")
@@ -379,12 +402,47 @@ def resolve_agent_service_memory_policy(
                 memory_availability_reason=MEMORY_POLICY_BINDING_FAILURE_REASON,
             )
 
+    # A host policy may grant a fixed namespace, but cannot substitute for
+    # transport identity or make an unavailable remote dependency usable.
+    base_store = unwrap_memory_store(memory)
+    remote_health = None
+    if isinstance(base_store, RemoteMemoryStore):
+        try:
+            base_store.validate_identity_context()
+        except RemoteMemoryStoreIdentityError as error:
+            return AgentServiceMemoryPolicy(
+                memory=InMemoryMemoryStore(),
+                memory_enabled=False,
+                memory_available=False,
+                memory_availability_reason=str(error),
+            )
+        remote_health = remote_memory_readiness()
+        if not remote_health.available:
+            return AgentServiceMemoryPolicy(
+                memory=InMemoryMemoryStore(),
+                memory_enabled=False,
+                memory_available=False,
+                memory_availability_reason=remote_health.reason,
+                memory_remote_status=remote_health.status,
+                memory_semantic_available=remote_health.semantic_available,
+            )
+
     return AgentServiceMemoryPolicy(
         memory=memory,
         memory_enabled=enabled,
         memory_available=True if override is None else override.available,
-        memory_availability_reason=None if override is None else override.reason,
+        memory_availability_reason=(
+            override.reason
+            if override is not None and override.reason
+            else (None if remote_health is None else remote_health.reason)
+        ),
         memory_access_scope=access_scope,
+        memory_remote_status=remote_health.status
+        if remote_health is not None
+        else (None if override is None else override.remote_status),
+        memory_semantic_available=remote_health.semantic_available
+        if remote_health is not None
+        else (None if override is None else override.semantic_available),
     )
 
 
@@ -3328,10 +3386,11 @@ class AgentServiceManager:
                 memory_availability_reason=lookup_failure_reason,
             )
         else:
-            policy = await resolve_agent_service_memory_policy_async(
-                task=task,
-                agent_config=agent_config,
-            )
+            with UserContext(ambient_owner_user_id):
+                policy = await resolve_agent_service_memory_policy_async(
+                    task=task,
+                    agent_config=agent_config,
+                )
         execution_metadata = policy.execution_metadata(
             ambient_owner_user_id=ambient_owner_user_id,
             ambient_execution_scope=ambient_execution_scope,
@@ -4527,10 +4586,11 @@ class AgentServiceManager:
                 if agent_config
                 else None
             )
-            memory_policy = await resolve_agent_service_memory_policy_async(
-                task=task,
-                agent_config=agent_config,
-            )
+            with UserContext(user_id):
+                memory_policy = await resolve_agent_service_memory_policy_async(
+                    task=task,
+                    agent_config=agent_config,
+                )
             allowed_external_dirs = _build_allowed_external_dirs(
                 user_id,
                 scope=scope,

@@ -192,6 +192,11 @@ LLM_STREAM_DEGENERATE_WINDOW = "XAGENT_LLM_STREAM_DEGENERATE_WINDOW"
 LLM_STREAM_DEGENERATE_MAX_PERIOD = "XAGENT_LLM_STREAM_DEGENERATE_MAX_PERIOD"
 LLM_STREAM_NO_PAYLOAD_ABORT_MODELS = "XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS"
 LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS = "XAGENT_LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS"
+MEMORY_BACKEND = "XAGENT_MEMORY_BACKEND"
+MEMORY_SERVICE_URL = "XAGENT_MEMORY_SERVICE_URL"
+MEMORY_SERVICE_KEY = "XAGENT_MEMORY_SERVICE_KEY"
+MEMORY_AGENT_SEATS = "XAGENT_MEMORY_AGENT_SEATS"
+MEMORY_AGENT_BINDINGS = "XAGENT_MEMORY_AGENT_BINDINGS"
 SANDBOX_CPUS = "SANDBOX_CPUS"
 SANDBOX_MEMORY = "SANDBOX_MEMORY"
 SANDBOX_PIDS_LIMIT = "SANDBOX_PIDS_LIMIT"
@@ -4678,3 +4683,61 @@ def get_zendesk_marketplace_headers() -> dict[str, str]:
             continue
         headers[header] = value
     return headers
+
+
+def get_memory_backend() -> str:
+    """Return the selected persistent-memory backend name.
+
+    ``""`` (the default) keeps the local LanceDB lifecycle. ``"remote"``
+    selects the memory SaaS adapter
+    (``xagent.core.memory.remote.RemoteMemoryStore``). The value is
+    normalized to lower case; an unknown name is returned as-is so the
+    selection point can report it instead of silently falling back.
+    """
+    return os.getenv(MEMORY_BACKEND, "").strip().lower()
+
+
+def get_memory_service_url() -> str | None:
+    """Return the memory SaaS base URL, or ``None`` when unset."""
+    value = os.getenv(MEMORY_SERVICE_URL)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def get_memory_service_key() -> str | None:
+    """Return the memory SaaS bearer key, or ``None`` when unset.
+
+    Read from the environment only: the key must never be written into the
+    repository or a log.
+    """
+    value = os.getenv(MEMORY_SERVICE_KEY)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def get_memory_agent_seats_enabled() -> bool:
+    """Whether a delegated child may run under its own agent seat (T14 §0.2).
+
+    On by default. The switch only gates the identity override: the memory
+    service still authorizes every request. Independent mode requires administrator-attested initialization bindings
+    and a backend ownership check; missing bindings deny delegated memory.
+    A disabled switch explicitly keeps the authenticated parent identity.
+    """
+    # Only an explicit opt-out may select the parent's memory. Empty or
+    # misspelled values retain independent mode and fail closed without a
+    # verified agent mapping.
+    return os.getenv(MEMORY_AGENT_SEATS, "").strip().lower() not in {
+        "false",
+        "0",
+        "no",
+        "off",
+    }
+
+
+def get_memory_agent_bindings() -> str | None:
+    """Administrator-supplied initialization bindings; never a request input."""
+    return os.getenv(MEMORY_AGENT_BINDINGS)

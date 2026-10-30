@@ -4703,3 +4703,62 @@ def test_python_executor_timeout_default_and_override(monkeypatch):
 def test_python_executor_timeout_rejects_invalid_values(monkeypatch, value):
     monkeypatch.setenv("XAGENT_PYTHON_EXECUTOR_TIMEOUT_SECONDS", value)
     assert config.get_python_executor_timeout_seconds() == 1200
+
+
+@pytest.mark.parametrize(
+    "value, expected", [(None, ""), (" REMOTE ", "remote"), ("invalid", "invalid")]
+)
+def test_memsrv_backend_config(monkeypatch, value, expected):
+    from xagent.config import get_memory_backend
+
+    monkeypatch.delenv("XAGENT_MEMORY_BACKEND", raising=False)
+    if value is not None:
+        monkeypatch.setenv("XAGENT_MEMORY_BACKEND", value)
+    assert get_memory_backend() == expected
+
+
+def test_memsrv_service_and_identity_config(monkeypatch):
+    from xagent.config import (
+        get_memory_agent_bindings,
+        get_memory_agent_seats_enabled,
+        get_memory_service_key,
+        get_memory_service_url,
+    )
+
+    for name in ("URL", "KEY"):
+        monkeypatch.setenv(f"XAGENT_MEMORY_SERVICE_{name}", "   ")
+    assert get_memory_service_url() is None
+    assert get_memory_service_key() is None
+    monkeypatch.setenv("XAGENT_MEMORY_SERVICE_URL", " http://memory-internal ")
+    monkeypatch.setenv("XAGENT_MEMORY_SERVICE_KEY", " fixture-key ")
+    assert get_memory_service_url() == "http://memory-internal"
+    assert get_memory_service_key() == "fixture-key"
+    monkeypatch.delenv("XAGENT_MEMORY_AGENT_SEATS", raising=False)
+    assert get_memory_agent_seats_enabled() is True
+    monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", "false")
+    assert get_memory_agent_seats_enabled() is False
+    monkeypatch.setenv("XAGENT_MEMORY_AGENT_BINDINGS", "[]")
+    assert get_memory_agent_bindings() == "[]"
+
+
+@pytest.mark.parametrize(
+    "value, independent",
+    [
+        ("", True),
+        (" ", True),
+        ("tru", True),
+        ("enabled", True),
+        ("true", True),
+        ("false", False),
+        ("0", False),
+        (" NO ", False),
+        ("off", False),
+    ],
+)
+def test_memsrv_independent_mode_requires_explicit_parent_opt_out(
+    monkeypatch, value, independent
+):
+    from xagent.config import get_memory_agent_seats_enabled
+
+    monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", value)
+    assert get_memory_agent_seats_enabled() is independent

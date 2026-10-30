@@ -1,0 +1,1578 @@
+"""Contract tests for the remote memory adapter (方案 §3.1/§3.5).
+
+The HTTP layer is faked, so these tests never touch the network (pytest-socket
+is active in this repository). They pin:
+
+* the wire shape of all nine ``MemoryStore`` methods plus the two scope
+  overrides: method, path, headers, body, and the response-to-``MemoryNote``
+  reconstruction;
+* the §3.5 semantic equivalences: raise-don't-swallow on service failure,
+  byte-identical denial message, bytes/base64 round-trip, naive timestamps,
+  clear/stats scoped to the caller, filter pass-through, no write retries;
+* identity header behaviour with and without an active ``current_user_id``;
+* the T14 §B1 additions: the ``[to:<target>]`` delivery marker (and every shape
+  that must stay a normal write), the explicit-owner header, and the cached
+  ``/readyz`` probe behind the task-startup memory policy.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+from datetime import datetime, timezone
+from typing import Any, List, Optional, cast
+
+import pytest
+import requests
+
+from xagent.core.execution_scope import (
+    ExecutionScope,
+    reset_execution_scope,
+    set_execution_scope,
+)
+from xagent.core.memory import remote as remote_module
+from xagent.core.memory.core import MemoryNote
+from xagent.core.memory.remote import (
+    NOT_FOUND_OR_DENIED_ERROR,
+    READINESS_UNAVAILABLE_REASON,
+    READINESS_UNCONFIGURED_REASON,
+    READY_PATH,
+    SCOPE_DIMENSIONS_FILTER_KEY,
+    RemoteMemoryStore,
+    RemoteMemoryStoreConfigurationError,
+    RemoteMemoryStoreError,
+    RemoteMemoryStoreIdentityError,
+    RemoteMemoryStoreIncompleteError,
+    explicit_memory_owner,
+    remote_memory_ready,
+    remote_memory_store_from_config,
+)
+from xagent.core.memory.scope_columns import SCOPE_EXCLUSIVE_FILTER_KEY
+from xagent.core.user_context import current_user_id
+
+SERVICE_URL = "http://memsrv:8080"
+
+
+SERVICE_KEY = "svc-key"
+
+
+SERVICE_PROFILE = hashlib.sha256(SERVICE_KEY.encode()).hexdigest()
+
+
+def _response(
+    status: int = 200, payload: Any = None, *, raw: Optional[str] = None
+) -> requests.Response:
+    response = requests.Response()
+    response.status_code = status
+    body = (
+        raw if raw is not None else json.dumps(payload if payload is not None else {})
+    )
+    response._content = body.encode("utf-8")  # noqa: SLF001 - fake transport
+    response.headers["Content-Type"] = "application/json"
+    return response
+
+
+class FakeSession:
+    """Records requests and replays scripted responses in order."""
+
+    def __init__(self, responses: List[Any]) -> None:
+        self._responses = list(responses)
+        self.calls: List[dict[str, Any]] = []
+
+    def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        self.calls.append({"method": method, "url": url, **kwargs})
+        if not self._responses:
+            raise AssertionError(f"unexpected request: {method} {url}")
+        item = self._responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return cast(requests.Response, item)
+
+
+class RecordingStore(RemoteMemoryStore):
+    """The adapter with a scripted fake transport."""
+
+    def __init__(self, *responses: Any, user_id: Optional[int] = 23) -> None:
+        self.session = FakeSession(list(responses))
+        super().__init__(
+            SERVICE_URL,
+            SERVICE_KEY,
+            session=self.session,  # type: ignore[arg-type]
+            user_id_provider=lambda: user_id,
+        )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_remote_diagnostics():
+    """Keep the 401-classification cache and the health signal test-local."""
+    remote_module._upstream_health.update(
+        {
+            "last_success_at": None,
+            "last_success_status": None,
+            "last_failure_at": None,
+            "last_failure_reason": None,
+            "last_event_at": None,
+            "last_event_kind": None,
+            "last_status": None,
+            "last_path": None,
+            "last_error_code": None,
+            "last_error_message": None,
+            "consecutive_transport_failures": 0,
+        }
+    )
+    yield
+
+
+def _note(**overrides: Any) -> MemoryNote:
+    base: dict[str, Any] = {
+        "id": "note-1",
+        "content": "hello",
+        "keywords": ["k1"],
+        "tags": ["t1"],
+        "category": "general",
+        "metadata": {"source": "test"},
+    }
+    base.update(overrides)
+    return MemoryNote(**base)
+
+
+@pytest.fixture
+def scope() -> Any:
+    """Activate an execution scope for the duration of one test."""
+    token = set_execution_scope(
+        ExecutionScope(
+            memory_dimensions={"client_application_id": "42"},
+            strict_memory_isolation=False,
+        )
+    )
+    try:
+        yield
+    finally:
+        reset_execution_scope(token)
+
+
+@pytest.fixture
+def strict_scope() -> Any:
+    token = set_execution_scope(
+        ExecutionScope(memory_dimensions={}, strict_memory_isolation=True)
+    )
+    try:
+        yield
+    finally:
+        reset_execution_scope(token)
+
+
+def test_add_posts_note_and_returns_service_id() -> None:
+    store = RecordingStore(_response(200, {"id": "server-id"}))
+
+    response = store.add(_note())
+
+    assert response.success is True
+    assert response.memory_id == "server-id"
+    call = store.session.calls[-1]
+    assert call["method"] == "POST"
+    assert call["url"] == f"{SERVICE_URL}/v1/memory/notes"
+    body = call["json"]
+    assert body["id"] == "note-1"
+    assert body["content"] == "hello"
+    assert body["keywords"] == ["k1"]
+    assert body["tags"] == ["t1"]
+    assert body["category"] == "general"
+    assert body["mime_type"] == "text/plain"
+    assert body["metadata"] == {"source": "test"}
+
+
+def test_add_drops_caller_supplied_user_id() -> None:
+    """Ownership is server-side (§3.4.3): a stale stamp must not be forwarded."""
+    store = RecordingStore(_response(200, {"id": "n"}))
+
+    store.add(_note(metadata={"user_id": 7, "source": "test"}))
+
+    assert store.session.calls[-1]["json"]["metadata"] == {"source": "test"}
+
+
+def test_add_stamps_execution_scope_dimensions(scope: Any) -> None:
+    store = RecordingStore(_response(200, {"id": "n"}))
+
+    store.add(_note())
+
+    metadata = store.session.calls[-1]["json"]["metadata"]
+    assert metadata["execution_scope_client_application_id"] == "42"
+
+
+def test_add_encodes_binary_content_as_base64() -> None:
+    store = RecordingStore(_response(200, {}), _response(200, {}))
+
+    store.add(_note(content=b"\x00\x01binary"))
+
+    body = store.session.calls[-1]["json"]
+    assert "content" not in body
+    assert body["content_b64"] == base64.b64encode(b"\x00\x01binary").decode("ascii")
+    # An empty body is tolerated: the id is client-side.
+    assert store.add(_note()).success is True
+
+
+def test_remember_posts_the_judged_write_and_returns_the_branch() -> None:
+    """The judged write goes to /remember and reports merge / parent / create."""
+    store = RecordingStore(
+        _response(
+            200,
+            {"action": "parent", "id": "server-id", "parent_id": "parent-1"},
+        )
+    )
+
+    response = store.remember(_note())
+
+    assert response.success is True
+    assert response.memory_id == "server-id"
+    assert response.metadata == {"action": "parent", "parent_id": "parent-1"}
+    call = store.session.calls[-1]
+    assert call["method"] == "POST"
+    assert call["url"] == f"{SERVICE_URL}/v1/memory/remember"
+    body = call["json"]
+    assert body["content"] == "hello"
+    assert body["category"] == "general"
+    assert body["keywords"] == ["k1"]
+    assert body["metadata"] == {"source": "test"}
+    assert body["force"] is False
+    # The service assigns the id; sending a client uuid would only risk a 409.
+    assert "id" not in body
+
+
+def test_remember_forwards_force_kind_and_drops_user_id() -> None:
+    store = RecordingStore(_response(200, {"action": "merge", "id": "n"}))
+
+    response = store.remember(
+        _note(metadata={"user_id": 7, "kind": "domain_insight"}), force=True
+    )
+
+    body = store.session.calls[-1]["json"]
+    assert body["force"] is True
+    assert body["kind"] == "domain_insight"
+    assert body["metadata"] == {"kind": "domain_insight"}
+    assert response.metadata == {"action": "merge", "parent_id": None}
+
+
+def test_remember_stamps_execution_scope_dimensions(scope: Any) -> None:
+    store = RecordingStore(_response(200, {"action": "create", "id": "n"}))
+
+    store.remember(_note())
+
+    metadata = store.session.calls[-1]["json"]["metadata"]
+    assert metadata["execution_scope_client_application_id"] == "42"
+
+
+def test_remember_surfaces_the_service_degraded_flag() -> None:
+    """The service's ``degraded`` flag is not dropped (X-04)."""
+    store = RecordingStore(
+        _response(
+            200,
+            {
+                "action": "merge",
+                "id": "n",
+                "parent_id": "p",
+                "degraded": True,
+            },
+        )
+    )
+
+    response = store.remember(_note())
+
+    assert response.metadata == {
+        "action": "merge",
+        "parent_id": "p",
+        "degraded": True,
+    }
+
+
+def test_remember_raises_on_a_rejected_write() -> None:
+    store = RecordingStore(_response(400, {"error": {"code": "bad_request"}}))
+
+    with pytest.raises(RemoteMemoryStoreError):
+        store.remember(_note())
+
+
+def test_get_returns_memory_note_instance_with_naive_timestamp() -> None:
+    store = RecordingStore(
+        _response(
+            200,
+            {
+                "id": "note-1",
+                "content": "hello",
+                "keywords": ["k1"],
+                "tags": ["t1"],
+                "category": "general",
+                "timestamp": "2026-01-02T03:04:05",
+                "mime_type": "text/plain",
+                "metadata": {"user_id": 7},
+            },
+        )
+    )
+
+    response = store.get("note-1")
+
+    assert response.success is True
+    assert isinstance(response.content, MemoryNote)
+    assert response.content.id == "note-1"
+    assert response.content.content == "hello"
+    assert response.content.metadata == {"user_id": 7}
+    assert response.content.timestamp == datetime(2026, 1, 2, 3, 4, 5)
+    assert response.content.timestamp.tzinfo is None
+    call = store.session.calls[-1]
+    assert call["method"] == "GET"
+    assert call["url"] == f"{SERVICE_URL}/v1/memory/notes/note-1"
+
+
+def test_get_decodes_content_b64_and_normalizes_aware_timestamp() -> None:
+    store = RecordingStore(
+        _response(
+            200,
+            {
+                "id": "note-1",
+                "content_b64": base64.b64encode(b"\x00\x01").decode("ascii"),
+                "timestamp": "2026-01-02T03:04:05+08:00",
+            },
+        )
+    )
+
+    note = store.get("note-1").content
+
+    assert isinstance(note, MemoryNote)
+    assert note.content == b"\x00\x01"
+    # The wire instant is 19:04 UTC; the adapter returns naive local time.
+    expected = datetime(2026, 1, 1, 19, 4, 5, tzinfo=timezone.utc)
+    assert note.timestamp == expected.astimezone().replace(tzinfo=None)
+    assert note.timestamp.tzinfo is None
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_get_denied_returns_the_local_denial_message(status: int) -> None:
+    store = RecordingStore(_response(status, {"error": {"code": "denied"}}))
+
+    response = store.get("note-1")
+
+    assert response.success is False
+    assert response.error == NOT_FOUND_OR_DENIED_ERROR
+    assert response.memory_id == "note-1"
+
+
+def test_update_patches_only_editable_fields() -> None:
+    store = RecordingStore(_response(200, {"id": "note-1", "success": True}))
+
+    response = store.update(_note())
+
+    assert response.success is True
+    call = store.session.calls[-1]
+    assert call["method"] == "PATCH"
+    assert call["url"] == f"{SERVICE_URL}/v1/memory/notes/note-1"
+    assert call["json"]["content"] == "hello"
+
+
+def test_update_denied_returns_denial_message() -> None:
+    store = RecordingStore(_response(404, {}))
+
+    response = store.update(_note())
+
+    assert response.success is False
+    assert response.error == NOT_FOUND_OR_DENIED_ERROR
+
+
+def test_update_checks_scope_before_writing(strict_scope: Any) -> None:
+    """A note outside the active scope must not reach the service as a write."""
+    store = RecordingStore(
+        _response(
+            200,
+            {"id": "note-1", "content": "x", "metadata": {"execution_scope_a": "1"}},
+        )
+    )
+
+    response = store.update(_note())
+
+    assert response.success is False
+    assert response.error == NOT_FOUND_OR_DENIED_ERROR
+    assert [call["method"] for call in store.session.calls] == ["GET"]
+
+
+def test_delete_deletes_by_id() -> None:
+    store = RecordingStore(_response(204))
+
+    response = store.delete("note-1")
+
+    assert response.success is True
+    assert response.memory_id == "note-1"
+    call = store.session.calls[-1]
+    assert call["method"] == "DELETE"
+    assert call["url"] == f"{SERVICE_URL}/v1/memory/notes/note-1"
+
+
+def test_delete_missing_returns_denial_message() -> None:
+    store = RecordingStore(_response(404, {}))
+
+    response = store.delete("note-1")
+
+    assert response.success is False
+    assert response.error == NOT_FOUND_OR_DENIED_ERROR
+    assert response.memory_id == "note-1"
+
+
+def test_get_url_quotes_the_note_id() -> None:
+    store = RecordingStore(_response(404, {}))
+
+    store.get("a/b c")
+
+    assert store.session.calls[-1]["url"] == f"{SERVICE_URL}/v1/memory/notes/a%2Fb%20c"
+
+
+def test_search_forwards_query_filters_and_threshold() -> None:
+    filters = {"category": "general", "tags": ["t1"], "metadata": {"user_id": 3}}
+    store = RecordingStore(
+        _response(200, [{"id": "note-1", "content": "hello", "category": "general"}])
+    )
+
+    notes = store.search("hello", k=7, filters=filters, similarity_threshold=0.5)
+
+    assert [note.id for note in notes] == ["note-1"]
+    assert isinstance(notes[0], MemoryNote)
+    call = store.session.calls[-1]
+    assert call["method"] == "POST"
+    assert call["url"] == f"{SERVICE_URL}/v1/memory/search"
+    assert call["json"] == {
+        "query": "hello",
+        "k": 7,
+        "filters": filters,
+        "similarity_threshold": 0.5,
+    }
+    # The caller's dict is never mutated (no user_id filter is injected).
+    assert filters == {
+        "category": "general",
+        "tags": ["t1"],
+        "metadata": {"user_id": 3},
+    }
+
+
+def test_search_default_does_not_merge_scope_dimensions(scope: Any) -> None:
+    """Dimensions are stamp-only: without the opt-in key they never filter.
+
+    Auto-merging would blind cross-task recall and store_memory dedup the
+    moment a task scope carries dimensions.
+    """
+    store = RecordingStore(_response(200, []))
+
+    store.search("hello", filters={"category": "general"})
+
+    assert store.session.calls[-1]["json"]["filters"] == {"category": "general"}
+
+
+def test_search_opt_in_merges_scope_dimensions(scope: Any) -> None:
+    """The opt-in key merges the active scope's dimensions and is stripped."""
+    store = RecordingStore(_response(200, []))
+    filters = {"category": "general", SCOPE_DIMENSIONS_FILTER_KEY: True}
+
+    store.search("hello", filters=filters)
+
+    assert store.session.calls[-1]["json"]["filters"] == {
+        "category": "general",
+        "metadata": {"execution_scope_client_application_id": "42"},
+    }
+    # The caller's dict is never mutated (the reserved key stays put).
+    assert filters == {
+        "category": "general",
+        SCOPE_DIMENSIONS_FILTER_KEY: True,
+    }
+
+
+def test_search_adds_scope_exclusive_directive(strict_scope: Any) -> None:
+    store = RecordingStore(_response(200, []))
+
+    store.search("hello")
+
+    assert store.session.calls[-1]["json"]["filters"] == {
+        SCOPE_EXCLUSIVE_FILTER_KEY: True
+    }
+
+
+def test_search_accepts_wrapped_result_payload() -> None:
+    store = RecordingStore(_response(200, {"results": [{"id": "n1", "content": "x"}]}))
+
+    assert [note.id for note in store.search("x")] == ["n1"]
+
+
+def test_search_empty_array_is_a_real_empty_result() -> None:
+    store = RecordingStore(_response(200, []))
+
+    assert store.search("nothing") == []
+
+
+def test_list_all_posts_filters() -> None:
+    store = RecordingStore(
+        _response(200, {"memories": [{"id": "n1", "content": "x"}], "truncated": False})
+    )
+
+    notes = store.list_all({"category": "general"})
+
+    assert [note.id for note in notes] == ["n1"]
+    call = store.session.calls[-1]
+    assert call["method"] == "POST"
+    assert call["url"] == f"{SERVICE_URL}/v1/memory/list"
+    assert call["json"] == {"filters": {"category": "general"}}
+
+
+def test_list_all_opt_in_merges_scope_dimensions(scope: Any) -> None:
+    store = RecordingStore(_response(200, {"results": [], "truncated": False}))
+
+    store.list_all({SCOPE_DIMENSIONS_FILTER_KEY: True})
+
+    assert store.session.calls[-1]["json"]["filters"] == {
+        "metadata": {"execution_scope_client_application_id": "42"}
+    }
+
+
+@pytest.mark.parametrize("count", [0, 9999, 10000, 10001])
+@pytest.mark.parametrize("filters", [None, {"category": "general"}])
+def test_list_all_requires_complete_results(count: int, filters: Any) -> None:
+    items = [{"id": str(i), "content": "x"} for i in range(min(count, 10000))]
+    store = RecordingStore(_response(200, {"notes": items, "truncated": count > 10000}))
+    if count > 10000:
+        with pytest.raises(RemoteMemoryStoreIncompleteError):
+            store.list_all(filters)
+    else:
+        assert len(store.list_all(filters)) == count
+    assert len(store.session.calls) == 1
+    assert store.session.calls[0]["json"] == {"filters": filters}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {"notes": []},
+        {"notes": [], "truncated": 0},
+        {"notes": [], "truncated": "false"},
+        {"notes": [], "truncated": None},
+    ],
+)
+def test_list_all_rejects_unknown_completeness(payload: Any) -> None:
+    store = RecordingStore(_response(200, payload))
+    with pytest.raises(RemoteMemoryStoreError, match="completeness flag"):
+        store.list_all()
+
+
+def test_bounded_search_and_inbox_keep_their_envelope_contract() -> None:
+    store = RecordingStore(
+        _response(200, {"notes": [{"id": "a"}], "truncated": True}),
+        _response(200, {"notes": [{"id": "b"}]}),
+    )
+    assert [note.id for note in store.search("query")] == ["a"]
+    assert [note.id for note in store.inbox_list()] == ["b"]
+
+
+def test_get_stats_normalizes_the_contract_keys() -> None:
+    store = RecordingStore(
+        _response(200, {"category_counts": {"general": 2, "decision": 1}})
+    )
+
+    stats = store.get_stats()
+
+    assert stats["total_count"] == 3
+    assert stats["category_counts"] == {"general": 2, "decision": 1}
+    assert stats["tag_counts"] == {}
+    assert stats["memory_store_type"] == "remote"
+    call = store.session.calls[-1]
+    assert call["method"] == "GET"
+    assert call["url"] == f"{SERVICE_URL}/v1/memory/stats"
+    assert call["params"] is None
+
+
+def test_get_stats_keeps_service_reported_store_type() -> None:
+    store = RecordingStore(
+        _response(200, {"total_count": 5, "memory_store_type": "memsrv"})
+    )
+
+    assert store.get_stats()["memory_store_type"] == "memsrv"
+
+
+def test_clear_posts_without_body() -> None:
+    store = RecordingStore(_response(200, {}))
+
+    store.clear()
+
+    call = store.session.calls[-1]
+    assert call["method"] == "POST"
+    assert call["url"] == f"{SERVICE_URL}/v1/memory/clear"
+    assert call["json"] is None
+
+
+def test_delete_by_scope_dimension_posts_predicate_and_returns_count() -> None:
+    store = RecordingStore(_response(200, {"deleted_count": 3}))
+
+    response = store.delete_by_scope_dimension("client_application_id", 42)
+
+    assert response.success is True
+    assert response.metadata == {"deleted_count": 3}
+    call = store.session.calls[-1]
+    assert call["url"] == f"{SERVICE_URL}/v1/memory/scope/delete-by-dimension"
+    assert call["json"] == {"dim_key": "client_application_id", "value": "42"}
+
+
+def test_delete_by_scope_dimension_403_raises() -> None:
+    store = RecordingStore(_response(403, {"error": {"code": "forbidden"}}))
+
+    with pytest.raises(RemoteMemoryStoreError) as error:
+        store.delete_by_scope_dimension("client_application_id", "42")
+
+    assert error.value.status_code == 403
+
+
+def test_list_scope_dimension_values_returns_a_set() -> None:
+    store = RecordingStore(_response(200, {"values": ["1", "2", "2"]}))
+
+    assert store.list_scope_dimension_values("client_application_id") == {"1", "2"}
+    call = store.session.calls[-1]
+    assert call["method"] == "GET"
+    assert call["url"] == f"{SERVICE_URL}/v1/memory/scope/values"
+    assert call["params"] == {"dim": "client_application_id"}
+
+
+@pytest.mark.parametrize("status", [500, 502, 503])
+def test_search_service_failure_raises(status: int) -> None:
+    store = RecordingStore(_response(status, {"error": {"code": "boom"}}))
+
+    with pytest.raises(RemoteMemoryStoreError):
+        store.search("hello")
+
+
+def test_list_all_service_failure_raises() -> None:
+    store = RecordingStore(_response(500, {}))
+
+    with pytest.raises(RemoteMemoryStoreError):
+        store.list_all()
+
+
+def test_get_5xx_raises_instead_of_reporting_a_miss() -> None:
+    store = RecordingStore(_response(500, {}))
+
+    with pytest.raises(RemoteMemoryStoreError):
+        store.get("note-1")
+
+
+def test_timeout_raises_adapter_error() -> None:
+    store = RecordingStore(requests.exceptions.Timeout("slow"))
+
+    with pytest.raises(RemoteMemoryStoreError):
+        store.search("hello")
+
+
+def test_connection_failure_raises_adapter_error() -> None:
+    store = RecordingStore(requests.exceptions.ConnectionError("refused"))
+
+    with pytest.raises(RemoteMemoryStoreError):
+        store.list_all()
+
+
+_GENERIC_401 = {"error": {"code": "unauthorized", "message": "unauthorized"}}
+
+
+def test_timeout_reports_an_unreachable_upstream_not_a_credential() -> None:
+    store = RecordingStore(requests.exceptions.Timeout("slow"))
+
+    with pytest.raises(RemoteMemoryStoreError) as error:
+        store.search("hello")
+
+    text = str(error.value)
+    assert "unreachable" in text
+    assert "not a credential rejection" in text
+    assert "timed out" in text
+
+
+def test_connection_failure_reports_an_unreachable_upstream_not_a_credential() -> None:
+    store = RecordingStore(requests.exceptions.ConnectionError("refused"))
+
+    with pytest.raises(RemoteMemoryStoreError) as error:
+        store.list_all()
+
+    text = str(error.value)
+    assert "unreachable" in text
+    assert "not a credential rejection" in text
+    assert "refused" in text
+
+
+def _health(**overrides: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "last_success_at": None,
+        "last_success_status": None,
+        "last_failure_at": None,
+        "last_failure_reason": None,
+        "last_event_at": None,
+        "last_event_kind": None,
+        "last_status": None,
+        "last_path": None,
+        "last_error_code": None,
+        "last_error_message": None,
+        "consecutive_transport_failures": 0,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_answered_calls_record_the_upstream_health_signal() -> None:
+    store = RecordingStore(_response(200, {"results": [], "truncated": False}))
+
+    store.list_all()
+
+    health = remote_module.remote_upstream_health()
+    assert health["last_event_kind"] == "answer"
+    assert health["last_status"] == 200
+    assert health["last_success_at"] is not None
+    assert health["consecutive_transport_failures"] == 0
+
+
+def test_transport_failures_record_the_upstream_health_signal() -> None:
+    store = RecordingStore(requests.exceptions.ConnectionError("refused"))
+
+    with pytest.raises(RemoteMemoryStoreError):
+        store.list_all()
+
+    health = remote_module.remote_upstream_health()
+    assert health["last_event_kind"] == "transport_error"
+    assert health["consecutive_transport_failures"] == 1
+    assert "连接失败" in health["last_failure_reason"]
+
+
+def test_upstream_report_is_ready_after_an_answered_call() -> None:
+    health = _health(
+        last_event_at=1761710000.0,
+        last_event_kind="answer",
+        last_status=200,
+        last_path="/v1/memory/list",
+        last_success_at=1761710000.0,
+    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(remote_module, "_upstream_health", health)
+        state, detail = remote_module.remote_upstream_report()
+
+    assert state == "ready"
+    assert "HTTP 200" in detail
+    assert "/v1/memory/list" in detail
+
+
+def test_upstream_report_degrades_on_a_5xx_answer() -> None:
+    health = _health(
+        last_event_at=1761710000.0,
+        last_event_kind="answer",
+        last_status=503,
+        last_path="/v1/memory/list",
+        last_error_code="resource_exhausted",
+    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(remote_module, "_upstream_health", health)
+        state, detail = remote_module.remote_upstream_report()
+
+    assert state == "degraded"
+    assert "HTTP 503" in detail
+    assert "code=resource_exhausted" in detail
+
+
+def test_upstream_report_degrades_on_a_transport_failure_after_success() -> None:
+    health = _health(
+        last_event_at=1761710000.0,
+        last_event_kind="transport_error",
+        last_failure_at=1761710000.0,
+        last_failure_reason="读超时 2.0s",
+        last_path="/v1/memory/search",
+        last_success_at=1761709000.0,
+        consecutive_transport_failures=2,
+    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(remote_module, "_upstream_health", health)
+        state, detail = remote_module.remote_upstream_report()
+
+    assert state == "degraded"
+    assert "不可达" in detail
+    assert "/v1/memory/search" in detail
+
+
+def test_upstream_report_is_unavailable_without_any_successful_call() -> None:
+    health = _health(
+        last_event_at=1761710000.0,
+        last_event_kind="transport_error",
+        last_failure_at=1761710000.0,
+        last_failure_reason="连接失败（ConnectionError）",
+        last_path="/v1/memory/list",
+        consecutive_transport_failures=1,
+    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(remote_module, "_upstream_health", health)
+        state, detail = remote_module.remote_upstream_report()
+
+    assert state == "unavailable"
+    assert "不可达" in detail
+
+
+def test_upstream_report_falls_back_to_the_cached_readiness_probe() -> None:
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(remote_module, "_upstream_health", _health())
+        patch.setattr(
+            remote_module, "remote_memory_ready", lambda **_kwargs: (True, None)
+        )
+        state, detail = remote_module.remote_upstream_report()
+    assert state == "ready"
+    assert "/readyz" in detail
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(remote_module, "_upstream_health", _health())
+        patch.setattr(
+            remote_module,
+            "remote_memory_ready",
+            lambda **_kwargs: (False, READINESS_UNAVAILABLE_REASON),
+        )
+        state, detail = remote_module.remote_upstream_report()
+    assert state == "unavailable"
+    assert READINESS_UNAVAILABLE_REASON in detail
+
+
+def test_non_json_success_payload_raises() -> None:
+    store = RecordingStore(_response(200, raw="<html>gateway</html>"))
+
+    with pytest.raises(RemoteMemoryStoreError):
+        store.search("hello")
+
+
+def test_writes_are_not_retried() -> None:
+    """§3.5.8: a failed write must surface, never be replayed."""
+    store = RecordingStore(_response(500, {}))
+
+    with pytest.raises(RemoteMemoryStoreError):
+        store.add(_note())
+
+    assert len(store.session.calls) == 1
+
+
+def test_read_timeout_is_tighter_than_write_timeout() -> None:
+    store = RecordingStore(_response(200, []), _response(200, {}))
+
+    store.search("hello")
+    store.add(_note())
+
+    assert store.session.calls[0]["timeout"] == (2.0, 2.0)
+    assert store.session.calls[1]["timeout"] == (2.0, 5.0)
+
+
+def test_identity_header_is_sent_with_the_contextvar_user() -> None:
+    session = FakeSession([_response(200, [])])
+    token = current_user_id.set(12345)
+    try:
+        store = RemoteMemoryStore(
+            SERVICE_URL,
+            SERVICE_KEY,
+            session=session,  # type: ignore[arg-type]
+        )
+        store.search("hello")
+    finally:
+        current_user_id.reset(token)
+
+    headers = session.calls[-1]["headers"]
+    assert headers["Authorization"] == f"Bearer {SERVICE_KEY}"
+    assert headers["X-User-External-Id"] == "12345"
+
+
+def test_missing_identity_is_rejected_without_http() -> None:
+    session = FakeSession([_response(200, [])])
+    token = current_user_id.set(None)
+    try:
+        store = RemoteMemoryStore(
+            SERVICE_URL,
+            SERVICE_KEY,
+            session=session,  # type: ignore[arg-type]
+        )
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            store.search("hello")
+    finally:
+        current_user_id.reset(token)
+
+    assert session.calls == []
+
+
+def test_factory_is_inactive_without_the_backend_switch(monkeypatch: Any) -> None:
+    monkeypatch.delenv("XAGENT_MEMORY_BACKEND", raising=False)
+    monkeypatch.delenv("XAGENT_MEMORY_SERVICE_URL", raising=False)
+    monkeypatch.delenv("XAGENT_MEMORY_SERVICE_KEY", raising=False)
+
+    assert remote_memory_store_from_config() is None
+
+
+def test_factory_builds_a_store_when_selected(monkeypatch: Any) -> None:
+    monkeypatch.setenv("XAGENT_MEMORY_BACKEND", "remote")
+    monkeypatch.setenv("XAGENT_MEMORY_SERVICE_URL", SERVICE_URL)
+    monkeypatch.setenv("XAGENT_MEMORY_SERVICE_KEY", SERVICE_KEY)
+
+    store = remote_memory_store_from_config()
+
+    assert isinstance(store, RemoteMemoryStore)
+    assert store._base_url == SERVICE_URL  # noqa: SLF001 - config wiring assertion
+
+
+def test_factory_rejects_an_incomplete_configuration(monkeypatch: Any) -> None:
+    monkeypatch.setenv("XAGENT_MEMORY_BACKEND", "remote")
+    monkeypatch.setenv("XAGENT_MEMORY_SERVICE_URL", SERVICE_URL)
+    monkeypatch.delenv("XAGENT_MEMORY_SERVICE_KEY", raising=False)
+
+    with pytest.raises(RemoteMemoryStoreConfigurationError):
+        remote_memory_store_from_config()
+
+
+def test_add_delivers_instead_of_writing_when_the_marker_names_a_target() -> None:
+    store = RecordingStore(_response(200, {"id": "delivered-1"}))
+
+    response = store.add(_note(content="[to:userb]   hello from A"))
+
+    assert response.success is True
+    assert response.memory_id == "delivered-1"
+    call = store.session.calls[-1]
+    assert call["method"] == "POST"
+    assert call["url"] == f"{SERVICE_URL}/v1/memory/deliver"
+    body = call["json"]
+    assert body["target"] == "userb"
+    assert body["content"] == "hello from A"
+    assert body["category"] == "general"
+    assert body["metadata"] == {"source": "test"}
+    assert body["keywords"] == ["k1"]
+    assert body["tags"] == ["t1"]
+    assert "id" not in body
+
+
+def test_delivery_strips_the_marker_and_a_following_newline() -> None:
+    store = RecordingStore(_response(200, {}))
+
+    store.add(_note(content="[to:userb]\nhello"))
+
+    assert store.session.calls[-1]["json"]["content"] == "hello"
+
+
+def test_share_dept_marker_plants_note_in_own_department() -> None:
+    store = RecordingStore(_response(200, {"id": "shared-1"}))
+
+    store.add(_note(content="[share:dept] team lesson learned"))
+
+    call = store.session.calls[-1]
+    assert call["url"] == f"{SERVICE_URL}/v1/memory/notes"
+    body = call["json"]
+    assert body["content"] == "team lesson learned"
+    assert body["space_kind"] == "department"
+    assert "space_id" not in body  # service resolves the caller's own department
+
+
+def test_share_marker_accepts_explicit_department_and_company() -> None:
+    store = RecordingStore(_response(200, {}), _response(200, {}))
+
+    store.add(_note(content="[share:dept:2] platform note"))
+    assert store.session.calls[-1]["json"]["space_kind"] == "department"
+    assert store.session.calls[-1]["json"]["space_id"] == 2
+
+    store.add(_note(content="[share:company] all-hands notice"))
+    body = store.session.calls[-1]["json"]
+    assert body["space_kind"] == "company"
+    assert "space_id" not in body
+    assert body["content"] == "all-hands notice"
+
+
+def test_share_marker_never_matches_without_a_body() -> None:
+    store = RecordingStore(_response(200, {}))
+
+    store.add(_note(content="[share:dept]"))
+    body = store.session.calls[-1]["json"]
+    assert "space_kind" not in body
+    assert body["content"] == "[share:dept]"
+
+
+def test_delivery_marker_takes_precedence_over_share() -> None:
+    store = RecordingStore(_response(200, {}))
+
+    store.add(_note(content="[to:userb] [share:dept] not shared"))
+    body = store.session.calls[-1]["json"]
+    assert store.session.calls[-1]["url"].endswith("/v1/memory/deliver")
+    assert body["content"] == "[share:dept] not shared"
+
+
+def test_delivery_never_forwards_a_caller_supplied_user_id() -> None:
+    store = RecordingStore(_response(200, {}))
+
+    store.add(_note(content="[to:userb] hi", metadata={"user_id": 7}))
+
+    assert store.session.calls[-1]["json"]["metadata"] == {}
+
+
+def test_delivery_carries_the_active_scope_dimensions(scope: Any) -> None:
+    """The channel is transparent: the caller's stamps ride along untouched."""
+    store = RecordingStore(_response(200, {}))
+
+    store.add(_note(content="[to:userb] hi"))
+
+    metadata = store.session.calls[-1]["json"]["metadata"]
+    assert metadata["execution_scope_client_application_id"] == "42"
+
+
+def test_delivery_omits_empty_keyword_and_tag_lists() -> None:
+    store = RecordingStore(_response(200, {}))
+
+    store.add(_note(content="[to:userb] hi", keywords=[], tags=[]))
+
+    body = store.session.calls[-1]["json"]
+    assert "keywords" not in body
+    assert "tags" not in body
+
+
+def test_delivery_target_is_trimmed() -> None:
+    store = RecordingStore(_response(200, {}))
+
+    store.add(_note(content="[to: userb ] hi"))
+
+    assert store.session.calls[-1]["json"]["target"] == "userb"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "plain note",
+        "[to:] hi",
+        "[to: ] hi",
+        "see [to:userb] for context",
+        "[TO:userb] hi",
+    ],
+    ids=("plain", "empty-target", "blank-target", "inline-marker", "wrong-case"),
+)
+def test_unmarked_content_keeps_the_notes_path(content: str) -> None:
+    store = RecordingStore(_response(200, {"id": "n"}))
+
+    store.add(_note(content=content))
+
+    assert store.session.calls[-1]["url"] == f"{SERVICE_URL}/v1/memory/notes"
+    assert store.session.calls[-1]["json"]["content"] == content
+
+
+def test_binary_content_is_never_read_as_a_marker() -> None:
+    store = RecordingStore(_response(200, {}))
+
+    store.add(_note(content=b"[to:userb] hi"))
+
+    body = store.session.calls[-1]["json"]
+    assert store.session.calls[-1]["url"] == f"{SERVICE_URL}/v1/memory/notes"
+    assert "content" not in body
+
+
+def test_delivery_failure_raises_instead_of_reporting_a_written_note() -> None:
+    """A service that has no deliver endpoint yet must not fake a write."""
+    store = RecordingStore(_response(405, {"error": {"code": "method_not_allowed"}}))
+
+    with pytest.raises(RemoteMemoryStoreError) as error:
+        store.add(_note(content="[to:userb] hi"))
+
+    assert error.value.status_code == 405
+
+
+def test_delivery_to_an_unknown_target_raises_with_the_service_status() -> None:
+    store = RecordingStore(_response(404, {"error": {"code": "not_found"}}))
+
+    with pytest.raises(RemoteMemoryStoreError) as error:
+        store.add(_note(content="[to:nobody] hi"))
+
+    assert error.value.status_code == 404
+
+
+def test_update_sends_the_explicit_owner_header() -> None:
+    store = RecordingStore(_response(200, {"id": "note-1", "success": True}))
+
+    store.update(_note(), owner_id=42)
+
+    headers = store.session.calls[-1]["headers"]
+    assert headers["X-Memory-Owner-Id"] == "42"
+
+
+def test_update_without_an_explicit_owner_sends_no_owner_header() -> None:
+    store = RecordingStore(_response(200, {"id": "note-1", "success": True}))
+
+    store.update(_note())
+
+    assert "X-Memory-Owner-Id" not in store.session.calls[-1]["headers"]
+
+
+def test_delete_sends_the_owner_header_and_keeps_the_identity_header() -> None:
+    session = FakeSession([_response(204)])
+    token = current_user_id.set(9)
+    try:
+        store = RemoteMemoryStore(
+            SERVICE_URL,
+            SERVICE_KEY,
+            session=session,  # type: ignore[arg-type]
+        )
+        store.delete("note-1", owner_id=42)
+    finally:
+        current_user_id.reset(token)
+
+    headers = session.calls[-1]["headers"]
+    assert headers["X-Memory-Owner-Id"] == "42"
+    assert headers["X-User-External-Id"] == "9"
+
+
+def test_owner_context_manager_scopes_the_header_to_the_block() -> None:
+    store = RecordingStore(_response(204), _response(204))
+
+    with explicit_memory_owner(7):
+        store.delete("note-1")
+    store.delete("note-2")
+
+    assert store.session.calls[0]["headers"]["X-Memory-Owner-Id"] == "7"
+    assert "X-Memory-Owner-Id" not in store.session.calls[1]["headers"]
+
+
+def test_owner_context_manager_with_none_is_a_no_op() -> None:
+    store = RecordingStore(_response(204))
+
+    with explicit_memory_owner(None):
+        store.delete("note-1")
+
+    assert "X-Memory-Owner-Id" not in store.session.calls[-1]["headers"]
+
+
+def test_explicit_owner_parameter_wins_over_the_ambient_context() -> None:
+    store = RecordingStore(_response(204))
+
+    with explicit_memory_owner(7):
+        store.delete("note-1", owner_id=42)
+
+    assert store.session.calls[-1]["headers"]["X-Memory-Owner-Id"] == "42"
+
+
+def test_explicit_owner_denial_keeps_the_adapter_denial_message() -> None:
+    store = RecordingStore(_response(403, {"error": {"code": "forbidden"}}))
+
+    response = store.delete("note-1", owner_id=42)
+
+    assert response.success is False
+    assert response.error == NOT_FOUND_OR_DENIED_ERROR
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_explicit_owner_update_denial_keeps_the_adapter_denial_message(
+    status: int,
+) -> None:
+    store = RecordingStore(_response(status, {}))
+
+    response = store.update(_note(), owner_id=42)
+
+    assert response.success is False
+    assert response.error == NOT_FOUND_OR_DENIED_ERROR
+
+
+class FakeProbeSession:
+    """Replays one scripted readiness answer; ``get`` only."""
+
+    def __init__(self, answer: Any) -> None:
+        self._answer = answer
+        self.calls: List[dict[str, Any]] = []
+
+    def get(self, url: str, **kwargs: Any) -> requests.Response:
+        self.calls.append({"url": url, **kwargs})
+        if isinstance(self._answer, Exception):
+            raise self._answer
+        return cast(requests.Response, self._answer)
+
+
+@pytest.fixture
+def configured_remote_service(monkeypatch: Any) -> Any:
+    """Configure the remote service and clear the process readiness cache."""
+    monkeypatch.setenv("XAGENT_MEMORY_SERVICE_URL", SERVICE_URL)
+    monkeypatch.setenv("XAGENT_MEMORY_SERVICE_KEY", SERVICE_KEY)
+    monkeypatch.setattr(remote_module, "_readiness_cache", None)
+    yield
+    monkeypatch.setattr(remote_module, "_readiness_cache", None)
+
+
+def test_readiness_probe_reports_a_ready_service(
+    configured_remote_service: Any,
+) -> None:
+    session = FakeProbeSession(
+        _response(
+            200,
+            {
+                "status": "ok",
+                "db": "ok",
+                "embedding": {"status": "ok", "degraded": False},
+            },
+        )
+    )
+
+    available, reason = remote_memory_ready(session=session)
+
+    assert available is True
+    assert reason is None
+    call = session.calls[-1]
+    assert call["url"] == f"{SERVICE_URL}{READY_PATH}"
+    assert call["headers"]["Authorization"] == f"Bearer {SERVICE_KEY}"
+    assert call["timeout"] == (2.0, 2.0)
+
+
+@pytest.mark.parametrize("status", [500, 503])
+def test_readiness_probe_reports_an_unavailable_service(
+    configured_remote_service: Any, status: int
+) -> None:
+    session = FakeProbeSession(_response(status, {"status": "unavailable"}))
+
+    available, reason = remote_memory_ready(session=session)
+
+    assert available is False
+    assert reason == READINESS_UNAVAILABLE_REASON
+
+
+def test_readiness_probe_reports_a_transport_failure(
+    configured_remote_service: Any,
+) -> None:
+    session = FakeProbeSession(requests.exceptions.ConnectionError("refused"))
+
+    available, reason = remote_memory_ready(session=session)
+
+    assert available is False
+    assert reason == READINESS_UNAVAILABLE_REASON
+
+
+def test_readiness_probe_reports_the_reason_without_a_service_url(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.delenv("XAGENT_MEMORY_SERVICE_URL", raising=False)
+    monkeypatch.setattr(remote_module, "_readiness_cache", None)
+    session = FakeProbeSession(
+        _response(
+            200,
+            {
+                "status": "ok",
+                "db": "ok",
+                "embedding": {"status": "ok", "degraded": False},
+            },
+        )
+    )
+
+    available, reason = remote_memory_ready(session=session)
+
+    assert available is False
+    assert reason == READINESS_UNCONFIGURED_REASON
+    assert session.calls == []
+
+
+def test_readiness_answer_is_cached_until_refreshed(
+    configured_remote_service: Any,
+) -> None:
+    ready = FakeProbeSession(
+        _response(
+            200,
+            {
+                "status": "ok",
+                "db": "ok",
+                "embedding": {"status": "ok", "degraded": False},
+            },
+        )
+    )
+    failing = FakeProbeSession(requests.exceptions.ConnectionError("refused"))
+
+    assert remote_memory_ready(session=ready) == (True, None)
+    # Inside the window the cached answer is reused: the service is not probed
+    # again for every task startup.
+    assert remote_memory_ready(session=failing) == (True, None)
+    assert failing.calls == []
+    # An explicit refresh always re-probes.
+    assert remote_memory_ready(session=failing, refresh=True) == (
+        False,
+        READINESS_UNAVAILABLE_REASON,
+    )
+    assert len(failing.calls) == 1
+
+
+@pytest.mark.parametrize("truncated", [False, True])
+def test_memsrv_list_envelope_keeps_scope_and_completeness(
+    scope: Any, truncated: bool
+) -> None:
+    envelope = {
+        "results": [
+            {
+                "id": "scoped",
+                "content": "body",
+                "metadata": {"execution_scope_client_application_id": "42"},
+            }
+        ],
+        "limit": 10000,
+        "truncated": truncated,
+    }
+    store = RecordingStore(_response(200, envelope))
+    if truncated:
+        with pytest.raises(RemoteMemoryStoreIncompleteError):
+            store.list_all({"category": "general", SCOPE_DIMENSIONS_FILTER_KEY: True})
+    else:
+        notes = store.list_all(
+            {"category": "general", SCOPE_DIMENSIONS_FILTER_KEY: True}
+        )
+        assert notes[0].id == "scoped"
+        assert notes[0].metadata["execution_scope_client_application_id"] == "42"
+    assert store.session.calls[0]["json"] == {
+        "filters": {
+            "category": "general",
+            "metadata": {"execution_scope_client_application_id": "42"},
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    ("code", "body", "expected", "semantic"),
+    [
+        (
+            200,
+            {
+                "status": "ok",
+                "db": "ok",
+                "embedding": {"status": "ok", "degraded": False},
+            },
+            "ready",
+            True,
+        ),
+        (
+            200,
+            {
+                "status": "degraded",
+                "db": "ok",
+                "embedding": {"status": "degraded", "degraded": True},
+            },
+            "degraded",
+            False,
+        ),
+        (
+            200,
+            {
+                "status": "unavailable",
+                "db": "error",
+                "embedding": {"status": "ok", "degraded": False},
+            },
+            "unavailable",
+            False,
+        ),
+        (200, {}, "protocol_error", False),
+        (200, [], "protocol_error", False),
+        (200, {"status": [], "db": "ok", "embedding": {}}, "protocol_error", False),
+        (
+            200,
+            {
+                "status": "ok",
+                "db": "ok",
+                "embedding": {"status": "ok", "degraded": "false"},
+            },
+            "protocol_error",
+            False,
+        ),
+        (
+            200,
+            {
+                "status": "ok",
+                "db": "ok",
+                "embedding": {"status": "degraded", "degraded": True},
+            },
+            "protocol_error",
+            False,
+        ),
+        (204, {}, "protocol_error", False),
+        (503, {}, "unavailable", False),
+    ],
+)
+def test_readiness_dependency_contract(
+    configured_remote_service: Any, code: int, body: Any, expected: str, semantic: bool
+) -> None:
+    result = remote_module.remote_memory_readiness(
+        session=FakeProbeSession(_response(code, body))
+    )
+    assert result.status == expected
+    assert result.semantic_available is semantic
+    assert result.available is (expected in {"ready", "degraded"})
+
+
+def test_readiness_malformed_json_is_protocol_error(
+    configured_remote_service: Any,
+) -> None:
+    result = remote_module.remote_memory_readiness(
+        session=FakeProbeSession(_response(200, raw="<html>"))
+    )
+    assert result.status == "protocol_error"
+
+
+def test_readiness_shared_cache_recovery_and_config_invalidation(
+    configured_remote_service: Any, monkeypatch: Any
+) -> None:
+    good = FakeProbeSession(
+        _response(
+            200,
+            {
+                "status": "ok",
+                "db": "ok",
+                "embedding": {"status": "ok", "degraded": False},
+            },
+        )
+    )
+    bad = FakeProbeSession(requests.exceptions.Timeout())
+    assert remote_memory_ready(session=bad)[0] is False
+    assert remote_module.remote_memory_readiness(session=good).status == "unavailable"
+    assert good.calls == []
+    assert remote_memory_ready(session=good, refresh=True) == (True, None)
+    monkeypatch.setenv("XAGENT_MEMORY_SERVICE_KEY", "changed-key")
+    assert remote_module.remote_memory_readiness(session=bad).status == "unavailable"
+    monkeypatch.setenv("XAGENT_MEMORY_SERVICE_URL", "http://replacement:8080")
+    assert remote_module.remote_memory_readiness(session=good).status == "ready"
+    assert good.calls[-1]["url"] == "http://replacement:8080/readyz"
+
+
+def test_degraded_bool_wrapper_keeps_the_reason(configured_remote_service: Any) -> None:
+    session = FakeProbeSession(
+        _response(
+            200,
+            {
+                "status": "degraded",
+                "db": "ok",
+                "embedding": {"status": "degraded", "degraded": True},
+            },
+        )
+    )
+    assert remote_memory_ready(session=session) == (
+        True,
+        remote_module.READINESS_DEGRADED_REASON,
+    )
+
+
+def test_readiness_recovers_after_cache_expiry(
+    configured_remote_service: Any, monkeypatch: Any
+) -> None:
+    clock = [100.0]
+    monkeypatch.setattr(remote_module.time, "monotonic", lambda: clock[0])
+    bad = FakeProbeSession(requests.exceptions.Timeout())
+    good = FakeProbeSession(
+        _response(
+            200,
+            {
+                "status": "ok",
+                "db": "ok",
+                "embedding": {"status": "ok", "degraded": False},
+            },
+        )
+    )
+    assert remote_module.remote_memory_readiness(session=bad).status == "unavailable"
+    clock[0] += remote_module.READINESS_CACHE_SECONDS + 1
+    assert remote_module.remote_memory_readiness(session=good).status == "ready"
+    assert len(good.calls) == 1
+
+
+def test_patch_payload_omits_identity_structure_and_unset_defaults() -> None:
+    store = RecordingStore(_response(200, {"id": "n", "success": True}))
+    response = store.update(MemoryNote(id="n", content="edited"))
+    assert response.success
+    assert store.session.calls[0]["json"] == {"content": "edited"}
+    assert [call["method"] for call in store.session.calls] == ["PATCH"]
+
+
+def test_patch_metadata_keeps_protected_values_for_server_validation() -> None:
+    metadata = {
+        "user_id": "31",
+        "execution_scope_agent": 10,
+        "parent_id": "root",
+        "delivery_id": "immutable",
+        "respire_key": "fixed",
+        "business": "new",
+    }
+    store = RecordingStore(_response(200, {"id": "note-1", "success": True}))
+    store.update(_note(metadata=metadata, space_kind="company", space_id=8))
+    body = store.session.calls[0]["json"]
+    assert body["metadata"] == metadata
+    assert set(body) <= {
+        "content",
+        "content_b64",
+        "keywords",
+        "tags",
+        "category",
+        "timestamp",
+        "mime_type",
+        "metadata",
+    }
+    assert metadata["user_id"] == "31"
+
+
+def test_patch_explicit_empty_fields_clear_and_inplace_defaults_are_included() -> None:
+    note = MemoryNote(id="n", content="edited", keywords=[], tags=[], metadata={})
+    assert RemoteMemoryStore._note_patch_payload(note) == {
+        "content": "edited",
+        "keywords": [],
+        "tags": [],
+        "metadata": {},
+    }
+    note = MemoryNote(id="n", content="edited")
+    note.tags.append("new")
+    note.metadata["business"] = "new"
+    assert RemoteMemoryStore._note_patch_payload(note) == {
+        "content": "edited",
+        "tags": ["new"],
+        "metadata": {"business": "new"},
+    }
+
+
+@pytest.mark.parametrize("binary", [b"", b"\x00\xff"])
+def test_patch_binary_payload_and_readback(binary: bytes) -> None:
+    wire = base64.b64encode(binary).decode()
+    store = RecordingStore(
+        _response(200, {"id": "n", "success": True}),
+        _response(200, {"id": "n", "content": None, "content_b64": wire}),
+    )
+    assert store.update(MemoryNote(id="n", content=binary)).success
+    assert store.session.calls[0]["json"] == {"content_b64": wire}
+    assert store.get("n").content.content == binary
+
+
+@pytest.mark.parametrize("status", [400, 401, 404, 405, 409, 500])
+def test_patch_failures_never_fall_back_to_put(status: int) -> None:
+    responses = [_response(status, {})]
+    store = RecordingStore(*responses)
+    if status == 404:
+        assert not store.update(_note()).success
+    else:
+        with pytest.raises(RemoteMemoryStoreError):
+            store.update(_note())
+    methods = [call["method"] for call in store.session.calls]
+    assert methods == ["PATCH"]  # no identity-switch diagnostic or PUT retry
+
+
+@pytest.mark.parametrize(
+    "reply", [{}, {"id": "n", "success": False}, {"id": "other", "success": True}]
+)
+def test_patch_requires_successful_matching_acknowledgement(reply: Any) -> None:
+    store = RecordingStore(_response(200, reply))
+    with pytest.raises(RemoteMemoryStoreError, match="acknowledgement"):
+        store.update(MemoryNote(id="n", content="body"))
+    assert len(store.session.calls) == 1
+
+
+def test_patch_ack_is_summary_not_a_complete_note() -> None:
+    reply = {
+        "id": "n",
+        "success": True,
+        "owner_id": 1,
+        "space_kind": None,
+        "space_id": None,
+        "modified_by": {"user_id": 1},
+        "degraded": True,
+    }
+    store = RecordingStore(_response(200, reply))
+    result = store.update(MemoryNote(id="n", content="body"))
+    assert result.success and result.content is None
+    assert result.metadata == {
+        key: value for key, value in reply.items() if key not in {"id", "success"}
+    }
+
+
+def test_patch_does_not_backfill_parent_or_path(scope: Any) -> None:
+    # The pre-read only runs for a strict dimension-less scope (the one-way
+    # visibility rule); a dimension-carrying scope writes straight through,
+    # and the PATCH body itself never carries structure columns.
+    store = RecordingStore(_response(200, {"id": "n", "success": True}))
+    assert store.update(MemoryNote(id="n", content="edited")).success
+    assert [call["method"] for call in store.session.calls] == ["PATCH"]
+    assert store.session.calls[-1]["json"] == {"content": "edited"}
