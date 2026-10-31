@@ -159,6 +159,10 @@ class TaskCreateResponse(BaseModel):
     task_id: int
     title: str
     status: str
+    dispatch_required: bool = Field(
+        True,
+        description="This endpoint creates a task; send execute_task over the authenticated task WebSocket to start it.",
+    )
     created_at: str
     model_id: Optional[str] = None
     small_fast_model_id: Optional[str] = None

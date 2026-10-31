@@ -100,12 +100,17 @@ describe("standalone browser security policy", () => {
     if (output === "export") expect(config.headers).toBeNull()
     else {
       expect(config.headers).toHaveLength(2)
+      const cache = pathToRegexp(config.headers[0].source)
+      expect(cache.test("/memory")).toBe(true)
+      expect(cache.test("/_next/static/chunks/hash.js")).toBe(false)
+      expect(config.headers[0].headers).toContainEqual({ key: "Cache-Control", value: "no-cache, must-revalidate" })
       const route = pathToRegexp(config.headers[0].source)
       for (const path of ["/", "/login", "/widgetfoo"]) expect(route.test(path)).toBe(true)
       for (const path of ["/widget", "/widget/x"]) expect(route.test(path)).toBe(false)
       expect(config.headers[0].headers.find(({ key }: { key: string }) => key === "X-Frame-Options")?.value).toBe("DENY")
       expect(config.headers[1].source).toBe("/widget/:path*")
       expect(config.headers[1].headers.some(({ key }: { key: string }) => key === "X-Frame-Options")).toBe(false)
+      expect(config.headers[1].headers).toContainEqual({ key: "Cache-Control", value: "no-cache, must-revalidate" })
     }
   })
 })

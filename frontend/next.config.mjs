@@ -30,12 +30,18 @@ const nextConfig = {
     async headers() {
       return [
         {
-          source: "/:path((?!widget(?:/|$)).*)",
-          headers: browserSecurityHeaders({ development: isDev }),
+          source: "/:path((?!widget(?:/|$)|_next(?:/|$)).*)",
+          headers: [
+            ...browserSecurityHeaders({ development: isDev }),
+            { key: "Cache-Control", value: "no-cache, must-revalidate" },
+          ],
         },
         {
           source: "/widget/:path*",
-          headers: browserSecurityHeaders({ embeddable: true, development: isDev }),
+          headers: [
+            ...browserSecurityHeaders({ embeddable: true, development: isDev }),
+            { key: "Cache-Control", value: "no-cache, must-revalidate" },
+          ],
         },
       ];
     },

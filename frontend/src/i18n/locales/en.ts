@@ -1706,6 +1706,7 @@ Build when you need.`,
   },
   memory: {
     loading: "Loading memories...",
+    success: { created: "Memory saved", updated: "Memory updated" },
     header: {
       backTitle: "Back to Home",
       title: "Memory Center",

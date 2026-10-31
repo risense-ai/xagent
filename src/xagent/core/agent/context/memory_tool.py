@@ -32,8 +32,8 @@ MEMORY_TOOLS_METADATA_KEY = "memory_tools_enabled"
 # Cap per ReAct run. Each DAG step runs its own ReActPattern, so a DAG
 # task gets a fresh cap per step rather than one shared task-wide cap.
 DEFAULT_MAX_STORES_PER_RUN = 5
-# Cosine distance passed to search(similarity_threshold=...): lower = stricter
-# dedup (fewer results count as duplicates).
+# Cosine distance used to retrieve duplicate candidates, not to establish
+# equality. Vector neighbours and lexical fallback hits may be distinct facts.
 DEFAULT_DEDUP_DISTANCE_THRESHOLD = 0.9
 DEFAULT_SEARCH_LIMIT = 5
 MAX_SEARCH_LIMIT = 20
@@ -161,7 +161,7 @@ class StoreMemoryTool:
                     "success": True,
                     "stored": False,
                     "message": (
-                        "A very similar memory already exists; skipped storing a duplicate."
+                        "The same memory already exists; skipped storing a duplicate."
                     ),
                 }
 
@@ -202,7 +202,17 @@ class StoreMemoryTool:
         except Exception:
             logger.exception("store_memory dedup search failed; storing anyway")
             return None
-        return results[0] if results else None
+        # Search is candidate retrieval, not proof of duplication: some stores
+        # fall back to lexical matching without applying the vector threshold,
+        # and even a high similarity score can hide a different value or fact.
+        # Confirm text equality within the existing category/identity scope.
+        # Keep case and internal whitespace meaningful (identifiers/code),
+        # matching only the outer trimming already applied to stored content.
+        for result in results or []:
+            candidate = getattr(result, "content", None)
+            if isinstance(candidate, str) and candidate.strip() == content:
+                return result
+        return None
 
     def _add(self, content: str, kind: str) -> str | None:
         note = MemoryNote(

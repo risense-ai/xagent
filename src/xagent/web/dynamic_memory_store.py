@@ -21,8 +21,14 @@ import threading
 from dataclasses import dataclass
 from typing import Optional, Union
 
+from ..core.memory.base import MemoryStore
 from ..core.memory.in_memory import InMemoryMemoryStore
 from ..core.memory.lancedb import LanceDBMemoryStore
+from ..core.memory.remote import (
+    RemoteMemoryStore,
+    remote_memory_readiness,
+    remote_upstream_report,
+)
 from .memory_lifecycle import (
     AdmissionResult,
     AuthorityCredentialUnavailable,
@@ -33,6 +39,8 @@ from .memory_lifecycle import (
     credential_failure_result,
     default_similarity_threshold,
     log_operator_guidance,
+    remote_admission_result,
+    remote_lifecycle_status,
 )
 from .models.database import get_db
 from .revocable_memory_store import RevocableMemoryStore, unwrap_memory_store
@@ -50,6 +58,7 @@ logger = logging.getLogger(__name__)
 MemoryStoreType = Union[
     InMemoryMemoryStore,
     LanceDBMemoryStore,
+    RemoteMemoryStore,
     UserIsolatedMemoryStore,
     RevocableMemoryStore,
 ]
@@ -153,8 +162,13 @@ class DynamicMemoryStoreManager:
         self._publication = publication
         self._generation += 1
 
-    def _revocable(self, store: MemoryStoreType) -> MemoryStoreType:
-        """Bind ``store`` to the generation it is about to be published under."""
+    def _revocable(self, store: MemoryStore) -> RevocableMemoryStore:
+        """Bind ``store`` to the generation it is about to be published under.
+
+        Accepts any ``MemoryStore`` because admission may publish a store the
+        local type alias does not enumerate (the remote adapter), and returns
+        the revocation wrapper the manager always publishes.
+        """
         return RevocableMemoryStore(store, self, self._generation + 1)
 
     def admit(self, *, writers_quiesced: bool = True) -> MemoryLifecycleStatus:
@@ -184,26 +198,30 @@ class DynamicMemoryStoreManager:
 
     def _admit_locked(self, *, writers_quiesced: bool) -> None:
         previous_publication = self._publication
-        try:
-            snapshot = _read_authority_snapshot()
-        except AuthorityCredentialUnavailable:
-            result = credential_failure_result()
-        except AuthorityUnreadable:
-            logger.warning(
-                "Persistent memory authority could not be read; admission deferred"
-            )
-            result = AdmissionResult(
-                MemoryLifecycleStatus(MemoryLifecycleState.RETRYABLE_UNAVAILABLE)
-            )
-        else:
-            if snapshot is None:
-                self._publish_in_memory_locked()
-                return
-            result = admit_authority_storage(
-                snapshot,
-                similarity_threshold=self._similarity_threshold,
-                writers_quiesced=writers_quiesced,
-            )
+        # Remote storage owns its vector space and needs no local embedding
+        # authority. Invalid selections fail closed before the local path.
+        result: AdmissionResult | None = remote_admission_result()
+        if result is None:
+            try:
+                snapshot = _read_authority_snapshot()
+            except AuthorityCredentialUnavailable:
+                result = credential_failure_result()
+            except AuthorityUnreadable:
+                logger.warning(
+                    "Persistent memory authority could not be read; admission deferred"
+                )
+                result = AdmissionResult(
+                    MemoryLifecycleStatus(MemoryLifecycleState.RETRYABLE_UNAVAILABLE)
+                )
+            else:
+                if snapshot is None:
+                    self._publish_in_memory_locked()
+                    return
+                result = admit_authority_storage(
+                    snapshot,
+                    similarity_threshold=self._similarity_threshold,
+                    writers_quiesced=writers_quiesced,
+                )
 
         if result.store is None:
             # A failed admission publishes nothing and takes nothing away: a
@@ -309,9 +327,27 @@ class DynamicMemoryStoreManager:
             raise MemoryUnavailableError(status)
         return store
 
-    def status(self) -> MemoryLifecycleStatus:
+    def _guard_remote_report(self, *, control_plane: bool) -> None:
+        """User reports require identity before any remote dependency probe.
+
+        Startup/background health callers may explicitly use the independent
+        control plane. That flag must never come from a user request parameter.
+        """
+        with self._lock:
+            publication = self._publication
+        base_store = (
+            unwrap_memory_store(publication.store) if publication is not None else None
+        )
+        if not control_plane and isinstance(base_store, RemoteMemoryStore):
+            base_store.validate_identity_context()
+
+    def status(self, *, control_plane: bool = False) -> MemoryLifecycleStatus:
         """Current public-safe lifecycle status. Never admits."""
-        return self.acquire()[1]
+        self._guard_remote_report(control_plane=control_plane)
+        store, status = self.acquire()
+        if isinstance(unwrap_memory_store(store), RemoteMemoryStore):
+            return remote_lifecycle_status(remote_memory_readiness())
+        return status
 
     def force_reinitialize(self) -> None:
         """Retained no-op: rebuilding a live store is an online reload.
@@ -338,7 +374,7 @@ class DynamicMemoryStoreManager:
             self._revalidated_publication_locked()
             return before is not self._publication
 
-    def get_store_info(self) -> dict:
+    def get_store_info(self, *, control_plane: bool = False) -> dict:
         """Public-safe description of the current memory store.
 
         Degrades instead of raising. This is the one report an operator has
@@ -355,6 +391,7 @@ class DynamicMemoryStoreManager:
         write through a store this manager could not revalidate. A status
         report is the one caller for which answering beats failing.
         """
+        self._guard_remote_report(control_plane=control_plane)
         with self._lock:
             try:
                 store, status = self.acquire()
@@ -371,15 +408,49 @@ class DynamicMemoryStoreManager:
         # Report what the storage adapter actually is, through both the
         # revocation and the user-isolation wrapper.
         base_store = unwrap_memory_store(store)
-        return {
+        # R2: the readiness endpoint answers 200 even when the service is
+        # degraded, so the lifecycle truth comes from the parsed readiness
+        # payload (DB / embedding / degraded), never from the status code.
+        if isinstance(base_store, RemoteMemoryStore):
+            status = remote_lifecycle_status(remote_memory_readiness())
+        info = {
             "store_type": type(base_store).__name__ if base_store is not None else None,
             "is_lancedb": isinstance(base_store, LanceDBMemoryStore),
             "state": status.state.value,
             "detail": status.detail,
             "mode": status.mode.value if status.mode is not None else None,
             "supports_vector_search": status.vector_search,
+            "remote_status": status.remote_status,
+            "reason": status.reason,
             "similarity_threshold": threshold,
         }
+        # 缺陷二: on the remote backend the lifecycle state describes only the
+        # *local* publication -- it says nothing about whether the upstream
+        # memory service answers. Fold the adapter's upstream health signal
+        # into the report so an operator never reads "ready" while every
+        # upstream call is failing. A non-ready lifecycle state is the bigger
+        # truth and always wins: memory is fenced off regardless of upstream,
+        # so the upstream is not even probed in that case.
+        if (
+            isinstance(base_store, RemoteMemoryStore)
+            and status.state is MemoryLifecycleState.READY
+        ):
+            # The preceding readiness call may have observed a context change.
+            # Revalidate before the separate upstream-report probe as well.
+            if not control_plane:
+                base_store.validate_identity_context()
+            try:
+                remote_state, remote_detail = remote_upstream_report()
+            except Exception:
+                logger.warning(
+                    "Remote upstream health report failed; keeping the "
+                    "lifecycle state in the store-info answer",
+                    exc_info=True,
+                )
+            else:
+                info["state"] = remote_state
+                info["detail"] = remote_detail
+        return info
 
 
 # Global instance
@@ -416,7 +487,7 @@ def admit_memory_storage_at_startup() -> Optional[MemoryLifecycleStatus]:
     """
     try:
         status = admit_memory_storage()
-        store_info = get_memory_store_manager().get_store_info()
+        store_info = get_memory_store_manager().get_store_info(control_plane=True)
     except Exception:
         # Memory must never be able to abort a boot. Unrelated functions start;
         # memory itself stays closed until an operator acts.
