@@ -239,6 +239,21 @@ def test_remote_patch_accepts_receipt_and_preserves_opaque_id(
     )
 
 
+@pytest.mark.parametrize("status", [403, 404])
+def test_edit_denied_after_successful_read_has_the_same_public_404(
+    remote_client, status
+):
+    client, session = remote_client
+    session.status = status
+    session.payload = {"error": {"message": "SYNTHETIC_PRIVATE_ACCESS_DIAGNOSTIC"}}
+    response = client.put(
+        f"/api/memory/{quote(NOTE_ID, safe='')}", json={"content": "synthetic edit"}
+    )
+    assert [call["method"] for call in session.calls] == ["GET", "PATCH"]
+    assert response.status_code == 404
+    assert response.json() == {"detail": "not found or not accessible"}
+
+
 @pytest.mark.parametrize("status", [404, 405])
 def test_remote_patch_never_falls_back_to_put(
     remote_client: tuple[TestClient, ScriptedSession], status: int

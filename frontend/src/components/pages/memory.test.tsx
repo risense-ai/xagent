@@ -18,16 +18,18 @@ import { MemoryPage } from "./memory"
 const response = (body: unknown, ok = true) => ({ ok, json: async () => body })
 let threshold: unknown
 let save: () => Promise<unknown>
+let notes: unknown[]
 
 beforeEach(() => {
   api.mockReset()
   success.mockReset()
   threshold = 0.4
+  notes = []
   save = async () => response({ memory_id: "synthetic-note" })
   api.mockImplementation((url: string, options?: RequestInit) => {
-    if (options?.method === "POST") return save()
+    if (options?.method === "POST" || options?.method === "PUT") return save()
     if (url.endsWith("/store-info")) return Promise.resolve(response({ similarity_threshold: threshold }))
-    if (url.includes("/list?")) return Promise.resolve(response({ memories: [], total_count: 0, filters_used: {} }))
+    if (url.includes("/list?")) return Promise.resolve(response({ memories: notes, total_count: notes.length, filters_used: {} }))
     if (url.endsWith("/stats")) return Promise.resolve(response({ total_count: 0, category_counts: {}, tag_counts: {}, memory_store_type: "synthetic" }))
     throw new Error("Unexpected synthetic API request")
   })
@@ -78,5 +80,36 @@ describe("memory report regressions", () => {
     fireEvent.click(screen.getByRole("button", { name: "common.save" }))
     await waitFor(() => expect(success).toHaveBeenCalledExactlyOnceWith("memory.success.created"))
     expect(api.mock.calls.filter(([, options]) => options?.method === "POST")).toHaveLength(2)
+  })
+
+  it.each(["create", "edit"])("keeps the pending %s dialog bound to its request", async kind => {
+    let finish!: (value: unknown) => void
+    save = () => new Promise(resolve => { finish = resolve })
+    notes = [{ id: "synthetic-note", content: "Original synthetic preference", keywords: [], tags: [], category: "general", metadata: {}, timestamp: "2026-10-31T00:00:00" }]
+    render(<MemoryPage />)
+    await screen.findByText("Original synthetic preference")
+    const open = () => {
+      if (kind === "create") fireEvent.click(screen.getByRole("button", { name: /memory.header.create/ }))
+      else {
+        fireEvent.click(screen.getByText("Original synthetic preference"))
+        fireEvent.click(screen.getByRole("button", { name: "memory.viewDialog.edit" }))
+      }
+    }
+    open()
+    fireEvent.change(screen.getByLabelText("memory.form.contentLabel"), { target: { value: "Pending synthetic draft" } })
+    fireEvent.click(screen.getByRole("button", { name: "common.save" }))
+    expect(screen.getByRole("button", { name: "common.cancel" })).toBeDisabled()
+    expect(screen.getByLabelText("memory.form.contentLabel")).toBeDisabled()
+    fireEvent.click(screen.getByRole("button", { name: "common.cancel" }))
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" })
+    fireEvent.click(screen.getByRole("button", { name: "Close" }))
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+    expect(screen.getByLabelText("memory.form.contentLabel")).toHaveValue("Pending synthetic draft")
+    finish(response({ memory_id: "synthetic-note" }))
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull())
+    open()
+    fireEvent.change(screen.getByLabelText("memory.form.contentLabel"), { target: { value: "Fresh synthetic draft" } })
+    await waitFor(() => expect(screen.getByLabelText("memory.form.contentLabel")).toHaveValue("Fresh synthetic draft"))
+    expect(success).toHaveBeenCalledExactlyOnceWith(kind === "create" ? "memory.success.created" : "memory.success.updated")
   })
 })

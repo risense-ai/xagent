@@ -12,6 +12,7 @@ from starlette import convertors as starlette_url  # codespell:ignore
 from ...core.memory.base import MemoryStore
 from ...core.memory.core import MemoryNote
 from ...core.memory.remote import (
+    NOT_FOUND_OR_DENIED_ERROR,
     READ_SCOPE_FILTER_KEY,
     RemoteMemoryNote,
     RemoteMemoryStore,
@@ -410,6 +411,8 @@ class MemoryManagementRouter:
                             "message": "Memory updated successfully",
                         }
                     else:
+                        if response.error == NOT_FOUND_OR_DENIED_ERROR:
+                            raise HTTPException(404, MEMORY_NOT_FOUND_DETAIL)
                         raise HTTPException(
                             status_code=500,
                             detail=response.error or "Failed to update memory",

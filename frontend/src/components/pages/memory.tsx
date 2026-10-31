@@ -322,6 +322,7 @@ export function MemoryPage() {
   }
 
   const openEditDialog = (memory: MemoryItem) => {
+    if (savePendingRef.current) return
     setEditingMemory(memory)
     setFormData({
       content: memory.content,
@@ -374,9 +375,9 @@ export function MemoryPage() {
             onCompositionEnd={handleCompositionEnd}
           />
 
-          <Dialog open={isCreateDialogOpen} onOpenChange={setIsCreateDialogOpen}>
+          <Dialog open={isCreateDialogOpen} onOpenChange={open => { if (!savePendingRef.current) setIsCreateDialogOpen(open) }}>
             <DialogTrigger asChild>
-              <Button size="sm" className="bg-primary hover:bg-primary/90 text-primary-foreground shrink-0">
+              <Button disabled={isSaving} size="sm" className="bg-primary hover:bg-primary/90 text-primary-foreground shrink-0">
                 <Plus className="h-4 w-4 mr-1 sm:mr-2" />
                 <span className="hidden sm:inline">{t("memory.header.create")}</span>
                 <span className="sm:hidden">{t("common.create") || t("memory.header.create")}</span>
@@ -691,7 +692,7 @@ export function MemoryPage() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={isEditDialogOpen} onOpenChange={setIsEditDialogOpen}>
+      <Dialog open={isEditDialogOpen} onOpenChange={open => { if (!savePendingRef.current) setIsEditDialogOpen(open) }}>
         <DialogContent className="max-w-2xl">
           <DialogHeader>
             <DialogTitle>{t("memory.editDialog.title")}</DialogTitle>
@@ -751,7 +752,7 @@ interface MemoryFormProps {
 function MemoryForm({ formData, setFormData, categories, onSubmit, onCancel, isSaving }: MemoryFormProps) {
   const { t } = useI18n()
   return (
-    <div className="space-y-4">
+    <fieldset disabled={isSaving} className="space-y-4">
       <div>
         <div className="mb-1.5">
           <Label htmlFor="content">{t("memory.form.contentLabel")}</Label>
@@ -804,12 +805,12 @@ function MemoryForm({ formData, setFormData, categories, onSubmit, onCancel, isS
         />
       </div>
       <div className="flex justify-end gap-2 pt-2">
-        <Button variant="outline" onClick={onCancel}>{t("common.cancel")}</Button>
+        <Button variant="outline" onClick={onCancel} disabled={isSaving}>{t("common.cancel")}</Button>
         <Button onClick={onSubmit} disabled={isSaving || !formData.content.trim()}>
           <Save className="h-4 w-4 mr-2" />
           {t("common.save")}
         </Button>
       </div>
-    </div>
+    </fieldset>
   )
 }
