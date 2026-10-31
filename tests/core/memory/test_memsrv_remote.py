@@ -60,6 +60,23 @@ SERVICE_KEY = "svc-key"
 SERVICE_PROFILE = hashlib.sha256(SERVICE_KEY.encode()).hexdigest()
 
 
+@pytest.mark.parametrize("scope", ["owner", "org"])
+def test_search_rejects_unsupported_list_scope_before_transport(scope):
+    store = RecordingStore(_response(200, {"results": []}))
+    with pytest.raises(RemoteMemoryStoreError, match="scope"):
+        store.search("synthetic", filters={remote_module.READ_SCOPE_FILTER_KEY: scope})
+    assert store.session.calls == []
+
+
+def test_unsupported_search_scope_still_validates_identity_without_transport():
+    store = RecordingStore(user_id=None)
+    with pytest.raises(RemoteMemoryStoreIdentityError):
+        store.search(
+            "synthetic", filters={remote_module.READ_SCOPE_FILTER_KEY: "owner"}
+        )
+    assert store.session.calls == []
+
+
 def _response(
     status: int = 200, payload: Any = None, *, raw: Optional[str] = None
 ) -> requests.Response:

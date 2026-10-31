@@ -99,6 +99,88 @@ def test_space_and_read_scope_use_separate_wire_fields(remote_client):
     assert response.json()["memories"][0]["space_kind"] == "company"
 
 
+@pytest.mark.parametrize("scope", ["owner", "org"])
+def test_search_rejects_unsupported_scope_without_claiming_it_was_applied(
+    remote_client, scope
+):
+    client, session = remote_client
+    response = client.get(
+        f"/api/memory/list?search=synthetic&scope={scope}&space=company"
+    )
+    assert response.status_code == 400
+    assert "scope" in response.json()["detail"]
+    assert "filters_used" not in response.json()
+    assert session.calls == []
+
+
+def test_search_visible_scope_and_space_have_supported_semantics(remote_client):
+    client, session = remote_client
+    session.payload = {"results": []}
+    response = client.get(
+        "/api/memory/list?search=synthetic&scope=visible&space=company"
+    )
+    assert response.status_code == 200
+    assert response.json()["filters_used"] == {"space": "company", "scope": "visible"}
+    assert session.calls[-1]["json"]["scope"] == "visible"
+    assert session.calls[-1]["json"]["filters"] == {"space": "company"}
+
+
+@pytest.mark.parametrize("scope", ["owner", "org"])
+def test_listing_still_sends_the_supported_scope_selection(remote_client, scope):
+    client, session = remote_client
+    session.payload = {"results": [], "truncated": False}
+    response = client.get(f"/api/memory/list?scope={scope}&space=company")
+    assert response.status_code == 200
+    assert response.json()["filters_used"] == {"scope": scope, "space": "company"}
+    assert session.calls[-1]["json"] == {
+        "scope": scope,
+        "filters": {"space": "company"},
+    }
+
+
+def test_listing_encodes_dates_and_paginates_a_complete_scoped_result(remote_client):
+    client, session = remote_client
+    session.payload = {
+        "results": [
+            {
+                "id": str(index),
+                "content": "synthetic",
+                "timestamp": f"2026-10-31T{hour}:00:00Z",
+            }
+            for index, hour in enumerate(("11", "10", "09"))
+        ],
+        "truncated": False,
+    }
+    response = client.get(
+        "/api/memory/list",
+        params={
+            "scope": "owner",
+            "space": "personal",
+            "date_from": "2026-10-30T00:00:00Z",
+            "date_to": "2026-11-01T00:00:00+08:00",
+            "limit": 1,
+            "offset": 1,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["total_count"] == 3
+    assert [note["id"] for note in response.json()["memories"]] == ["1"]
+    assert session.calls[-1]["json"] == {
+        "scope": "owner",
+        "filters": {
+            "space": "personal",
+            "date_from": "2026-10-30T00:00:00+00:00",
+            "date_to": "2026-10-31T16:00:00+00:00",
+        },
+    }
+
+
+def test_workspace_is_not_silently_treated_as_a_memory_space(remote_client):
+    client, session = remote_client
+    assert client.get("/api/memory/list?space=workspace").status_code == 422
+    assert session.calls == []
+
+
 def test_explicit_space_write_and_get_preserve_literal_content(remote_client):
     client, session = remote_client
     session.payload = {"id": NOTE_ID, "success": True}

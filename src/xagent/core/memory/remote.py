@@ -1653,6 +1653,12 @@ class RemoteMemoryStore(MemoryStore):
         filters: Optional[dict[str, Any]] = None,
         similarity_threshold: Optional[float] = None,
     ) -> List[MemoryNote]:
+        # Unlike List, memsrv Search does not implement owner/org read scope.
+        # Never report a silently ignored selection as an applied constraint.
+        scope = (filters or {}).get(READ_SCOPE_FILTER_KEY)
+        if scope is not None and scope != "visible":
+            self.validate_identity_context()
+            raise RemoteMemoryStoreError("Search only supports visible read scope")
         path = "/v1/memory/search"
         threshold = (
             get_memory_similarity_threshold()

@@ -213,7 +213,10 @@ class MemoryManagementRouter:
                 None, description="Search query to filter memories by content"
             ),
             space: Optional[Literal["personal", "company", "department"]] = Query(None),
-            scope: Optional[Literal["owner", "visible", "org"]] = Query(None),
+            scope: Optional[Literal["owner", "visible", "org"]] = Query(
+                None,
+                description="Read scope for listing; searches support visible only",
+            ),
             space_id: Optional[int] = Query(None, ge=1),
             similarity_threshold: Optional[float] = Query(
                 None,
@@ -233,6 +236,11 @@ class MemoryManagementRouter:
                     # Build filters
                     filters: dict[str, Any] = {}
                     store = self.memory_store
+                    if search and scope in {"owner", "org"}:
+                        raise HTTPException(
+                            400,
+                            "Search only supports visible scope; owner/org selection is unsupported",
+                        )
                     if space is not None or scope is not None or space_id is not None:
                         if not isinstance(
                             unwrap_memory_store(store), RemoteMemoryStore
