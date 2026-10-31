@@ -95,7 +95,9 @@ async def test_store_memory_adds_note_with_metadata() -> None:
 
 @pytest.mark.asyncio
 async def test_store_memory_skips_duplicate() -> None:
-    store = RecordingMemoryStore(search_results=[object()])
+    store = RecordingMemoryStore(
+        search_results=[MemoryNote(content="Same insight again.")]
+    )
     tool = StoreMemoryTool(memory_store=store, task="task")
 
     result = await tool.execute(content="Same insight again.")
@@ -105,6 +107,41 @@ async def test_store_memory_skips_duplicate() -> None:
     assert store.added == []
     assert store.searches[0]["filters"] == {"category": "react_memory"}
     assert tool.stored_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        object(),
+        MemoryNote(content=""),
+        MemoryNote(content=b"New insight."),
+        MemoryNote(content="Different insight."),
+    ],
+)
+async def test_store_memory_requires_matching_content_instead_of_opaque_candidates(
+    candidate,
+):
+    store = RecordingMemoryStore(search_results=[candidate])
+    result = await StoreMemoryTool(memory_store=store, task="task").execute(
+        "New insight."
+    )
+    assert result["stored"] is True
+    assert len(store.added) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "existing,stored",
+    [("  Same insight.  ", False), ("Identifier AbC", True), ("Two  spaces", True)],
+)
+async def test_store_memory_preserves_case_and_internal_whitespace(existing, stored):
+    content = {"Identifier AbC": "Identifier abc", "Two  spaces": "Two spaces"}.get(
+        existing, "Same insight."
+    )
+    store = RecordingMemoryStore(search_results=[MemoryNote(content=existing)])
+    result = await StoreMemoryTool(memory_store=store, task="task").execute(content)
+    assert result["stored"] is stored
 
 
 @pytest.mark.asyncio
