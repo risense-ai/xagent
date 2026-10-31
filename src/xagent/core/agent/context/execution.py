@@ -1445,7 +1445,10 @@ class ExecutionContext:
                 "third-party source messages: deleting a memory does not erase "
                 "those messages or prevent the user from sharing the fact again. "
                 "Do not store the deletion request or the deleted fact again "
-                "during the current turn."
+                "during the current turn. Do not claim a fact has been saved "
+                "merely because it appeared in conversation: confirm a successful "
+                "store_memory result, or verify an existing entry with search_memory. "
+                "Report storage errors honestly rather than promising persistence."
             )
         skill_index = self.metadata.get(SKILL_INDEX_METADATA_KEY)
         if isinstance(skill_index, list) and skill_index:

@@ -94,6 +94,17 @@ def dist_dir(tmp_path: Path) -> Path:
     return d
 
 
+@pytest.mark.parametrize("path", ["/", "/tools", "/agent/123", "/unknown"])
+def test_html_revalidates_while_fingerprinted_assets_stay_cacheable(dist_dir, path):
+    app = FastAPI()
+    assert mount_frontend(app, dist_dir)
+    with TestClient(app) as client:
+        response = client.get(path)
+        assert response.headers["cache-control"] == "no-cache, must-revalidate"
+        asset = client.get("/_next/static/chunks/main.js")
+        assert asset.headers["cache-control"] == "public, max-age=31536000, immutable"
+
+
 @pytest.mark.parametrize(
     "path", ["/", "/tools", "/tools.html", "/agent/123", "/unknown"]
 )

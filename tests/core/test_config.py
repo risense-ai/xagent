@@ -4762,3 +4762,24 @@ def test_memsrv_independent_mode_requires_explicit_parent_opt_out(
 
     monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", value)
     assert get_memory_agent_seats_enabled() is independent
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, 0.4),
+        ("bad", 0.4),
+        ("nan", 0.4),
+        ("inf", 0.4),
+        ("-1", 0.1),
+        ("3", 2.0),
+        ("0.25", 0.25),
+    ],
+)
+def test_memory_similarity_threshold_is_finite_and_bounded(
+    monkeypatch, value, expected
+):
+    monkeypatch.delenv(config.MEMORY_SIMILARITY_THRESHOLD, raising=False)
+    if value is not None:
+        monkeypatch.setenv(config.MEMORY_SIMILARITY_THRESHOLD, value)
+    assert config.get_memory_similarity_threshold() == expected

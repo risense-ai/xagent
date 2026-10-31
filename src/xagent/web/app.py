@@ -1196,6 +1196,7 @@ class FileStorageStartupSyncGateMiddleware:
         await self.app(scope, receive, send)
 
 
+@app.get("/healthz", include_in_schema=False)
 @app.get("/health")
 async def health_check() -> dict[str, Any]:
     """Health check endpoint for container probes.
@@ -1215,6 +1216,7 @@ async def health_check() -> dict[str, Any]:
     return payload
 
 
+@app.get("/readyz", include_in_schema=False)
 @app.get("/ready")
 async def readiness_check() -> JSONResponse:
     """Readiness check for startup file storage sync and, in native

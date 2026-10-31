@@ -197,6 +197,11 @@ MEMORY_SERVICE_URL = "XAGENT_MEMORY_SERVICE_URL"
 MEMORY_SERVICE_KEY = "XAGENT_MEMORY_SERVICE_KEY"
 MEMORY_AGENT_SEATS = "XAGENT_MEMORY_AGENT_SEATS"
 MEMORY_AGENT_BINDINGS = "XAGENT_MEMORY_AGENT_BINDINGS"
+# Existing deployment setting, retained without renaming for compatibility.
+MEMORY_SIMILARITY_THRESHOLD = "MEMORY_SIMILARITY_THRESHOLD"
+DEFAULT_MEMORY_SIMILARITY_THRESHOLD = 0.40
+MIN_MEMORY_SIMILARITY_THRESHOLD = 0.1
+MAX_MEMORY_SIMILARITY_THRESHOLD = 2.0
 SANDBOX_CPUS = "SANDBOX_CPUS"
 SANDBOX_MEMORY = "SANDBOX_MEMORY"
 SANDBOX_PIDS_LIMIT = "SANDBOX_PIDS_LIMIT"
@@ -4695,6 +4700,20 @@ def get_memory_backend() -> str:
     selection point can report it instead of silently falling back.
     """
     return os.getenv(MEMORY_BACKEND, "").strip().lower()
+
+
+def get_memory_similarity_threshold() -> float:
+    """Return the bounded cosine-distance limit shared by memory backends."""
+    raw = os.getenv(MEMORY_SIMILARITY_THRESHOLD)
+    try:
+        value = float(raw) if raw else DEFAULT_MEMORY_SIMILARITY_THRESHOLD
+    except ValueError:
+        return DEFAULT_MEMORY_SIMILARITY_THRESHOLD
+    if not math.isfinite(value):
+        return DEFAULT_MEMORY_SIMILARITY_THRESHOLD
+    return min(
+        MAX_MEMORY_SIMILARITY_THRESHOLD, max(MIN_MEMORY_SIMILARITY_THRESHOLD, value)
+    )
 
 
 def get_memory_service_url() -> str | None:

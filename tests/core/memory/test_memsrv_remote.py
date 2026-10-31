@@ -773,6 +773,22 @@ def test_upstream_report_degrades_on_a_5xx_answer() -> None:
     assert "code=resource_exhausted" in detail
 
 
+@pytest.mark.parametrize("status", [301, 400, 401, 403, 404, 409, 429])
+def test_upstream_report_does_not_call_non_2xx_a_success(status: int) -> None:
+    health = _health(
+        last_event_at=1761710000.0,
+        last_event_kind="answer",
+        last_status=status,
+        last_path="/v1/memory/notes/synthetic",
+    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(remote_module, "_upstream_health", health)
+        state, detail = remote_module.remote_upstream_report()
+    assert state == "degraded"
+    assert f"HTTP {status}" in detail
+    assert "调用成功" not in detail
+
+
 def test_upstream_report_degrades_on_a_transport_failure_after_success() -> None:
     health = _health(
         last_event_at=1761710000.0,
@@ -813,7 +829,9 @@ def test_upstream_report_falls_back_to_the_cached_readiness_probe() -> None:
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(remote_module, "_upstream_health", _health())
         patch.setattr(
-            remote_module, "remote_memory_ready", lambda **_kwargs: (True, None)
+            remote_module,
+            "remote_memory_readiness",
+            lambda **_kwargs: remote_module.RemoteMemoryReadiness("ready", True),
         )
         state, detail = remote_module.remote_upstream_report()
     assert state == "ready"
@@ -823,12 +841,29 @@ def test_upstream_report_falls_back_to_the_cached_readiness_probe() -> None:
         patch.setattr(remote_module, "_upstream_health", _health())
         patch.setattr(
             remote_module,
-            "remote_memory_ready",
-            lambda **_kwargs: (False, READINESS_UNAVAILABLE_REASON),
+            "remote_memory_readiness",
+            lambda **_kwargs: remote_module.RemoteMemoryReadiness(
+                "unavailable", reason=READINESS_UNAVAILABLE_REASON
+            ),
         )
         state, detail = remote_module.remote_upstream_report()
     assert state == "unavailable"
     assert READINESS_UNAVAILABLE_REASON in detail
+
+
+def test_upstream_report_keeps_degraded_readiness_without_call_history():
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(remote_module, "_upstream_health", _health())
+        patch.setattr(
+            remote_module,
+            "remote_memory_readiness",
+            lambda: remote_module.RemoteMemoryReadiness(
+                "degraded", reason="embedding_unavailable"
+            ),
+        )
+        state, detail = remote_module.remote_upstream_report()
+    assert state == "degraded"
+    assert "embedding_unavailable" in detail
 
 
 def test_non_json_success_payload_raises() -> None:

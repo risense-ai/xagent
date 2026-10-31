@@ -23,12 +23,21 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
+from starlette.types import Scope
 
 from .browser_security import page_security_headers
 
 logger = logging.getLogger(__name__)
 
 _SHELL_TOKEN = "__shell__"
+
+
+class _NextBuildAssets(StaticFiles):
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        response = await super().get_response(path, scope)
+        if path.startswith("static/") and response.status_code in {200, 304}:
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return response
 
 
 def _collect_backend_prefixes(app: FastAPI) -> frozenset[str]:
@@ -104,7 +113,9 @@ def mount_frontend(app: FastAPI, dist_dir: Path) -> bool:
     # Hashed build assets: let StaticFiles handle them directly.
     next_assets = dist_dir / "_next"
     if next_assets.is_dir():
-        app.mount("/_next", StaticFiles(directory=str(next_assets)), name="next-assets")
+        app.mount(
+            "/_next", _NextBuildAssets(directory=str(next_assets)), name="next-assets"
+        )
 
     shell_patterns = _build_shell_patterns(dist_dir)
     not_found = dist_dir / "404.html"
@@ -120,6 +131,8 @@ def mount_frontend(app: FastAPI, dist_dir: Path) -> bool:
             headers = page_security_headers(
                 embeddable=route == "widget.html" or route.startswith("widget/")
             )
+        if file.suffix.lower() in {".html", ".txt"}:
+            headers = {**(headers or {}), "Cache-Control": "no-cache, must-revalidate"}
         if shell_value is not None:
             return Response(
                 _render_shell(file, shell_value),

@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect, useRef, useCallback } from "react"
+import React, { useState, useEffect, useRef, useCallback } from "react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
@@ -15,6 +15,8 @@ import { Badge } from "@/components/ui/badge"
 import { InfoTooltip } from "@/components/ui/tooltip"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
+import { DEFAULT_MEMORY_SIMILARITY_THRESHOLD, memorySimilarityThreshold } from "@/lib/memory-threshold"
+import { toast } from "@/components/ui/sonner"
 import { useI18n } from "@/contexts/i18n-context"
 import { cn } from "@/lib/utils"
 import {
@@ -74,7 +76,9 @@ export function MemoryPage() {
   const [deletingId, setDeletingId] = useState<string | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [isBulkDeleting, setIsBulkDeleting] = useState(false)
-  const [similarityThreshold, setSimilarityThreshold] = useState([1.5])
+  const [similarityThreshold, setSimilarityThreshold] = useState([DEFAULT_MEMORY_SIMILARITY_THRESHOLD])
+  const [isSaving, setIsSaving] = useState(false)
+  const savePendingRef = useRef(false)
 
   const [filters, setFilters] = useState<MemoryFilters>({})
   const [limit, setLimit] = useState(50)
@@ -88,7 +92,20 @@ export function MemoryPage() {
     metadata: ""
   })
 
-  const [categories, setCategories] = useState<string[]>(['execution_memory', 'react_memory', 'general'])
+  const [categories] = useState<string[]>(['react_memory', 'general'])
+
+  useEffect(() => {
+    let active = true
+    apiRequest(`${getApiUrl()}/api/memory/store-info`, { headers: {} })
+      .then(async response => {
+        if (response.ok && active) {
+          const info = await response.json()
+          if (active) setSimilarityThreshold([memorySimilarityThreshold(info.similarity_threshold)])
+        }
+      })
+      .catch(() => { /* Keep the bounded default if diagnostics are unavailable. */ })
+    return () => { active = false }
+  }, [])
 
   // Search debouncing
   const searchTimeoutRef = useRef<NodeJS.Timeout | null>(null)
@@ -219,9 +236,12 @@ export function MemoryPage() {
     }
   }
 
-  useEffect(() => { fetchData() }, [filters, limit, offset])
+  useEffect(() => { fetchData() }, [filters, limit, offset, similarityThreshold[0]])
 
   const handleCreateMemory = async () => {
+    if (savePendingRef.current) return
+    savePendingRef.current = true
+    setIsSaving(true)
     try {
       const memoryData = {
         content: formData.content,
@@ -240,15 +260,21 @@ export function MemoryPage() {
       if (!response.ok) throw new Error("Failed to create memory")
 
       setIsCreateDialogOpen(false)
+      toast.success(t("memory.success.created"))
       setFormData({ content: "", keywords: "", tags: "", category: "general", metadata: "" })
       fetchData()
     } catch (err) {
       setError(err instanceof Error ? err.message : t("memory.errors.createFailed"))
+    } finally {
+      savePendingRef.current = false
+      setIsSaving(false)
     }
   }
 
   const handleUpdateMemory = async () => {
-    if (!editingMemory) return
+    if (!editingMemory || savePendingRef.current) return
+    savePendingRef.current = true
+    setIsSaving(true)
     try {
       const updateData = {
         content: formData.content,
@@ -267,11 +293,15 @@ export function MemoryPage() {
       if (!response.ok) throw new Error("Failed to update memory")
 
       setIsEditDialogOpen(false)
+      toast.success(t("memory.success.updated"))
       setEditingMemory(null)
       setFormData({ content: "", keywords: "", tags: "", category: "general", metadata: "" })
       fetchData()
     } catch (err) {
       setError(err instanceof Error ? err.message : t("memory.errors.updateFailed"))
+    } finally {
+      savePendingRef.current = false
+      setIsSaving(false)
     }
   }
 
@@ -362,6 +392,7 @@ export function MemoryPage() {
                 setFormData={setFormData}
                 categories={categories}
                 onSubmit={handleCreateMemory}
+                isSaving={isSaving}
                 onCancel={() => setIsCreateDialogOpen(false)}
               />
             </DialogContent>
@@ -671,6 +702,7 @@ export function MemoryPage() {
             setFormData={setFormData}
             categories={categories}
             onSubmit={handleUpdateMemory}
+            isSaving={isSaving}
             onCancel={() => { setIsEditDialogOpen(false); setEditingMemory(null) }}
           />
         </DialogContent>
@@ -713,9 +745,10 @@ interface MemoryFormProps {
   categories: string[]
   onSubmit: () => void
   onCancel: () => void
+  isSaving: boolean
 }
 
-function MemoryForm({ formData, setFormData, categories, onSubmit, onCancel }: MemoryFormProps) {
+function MemoryForm({ formData, setFormData, categories, onSubmit, onCancel, isSaving }: MemoryFormProps) {
   const { t } = useI18n()
   return (
     <div className="space-y-4">
@@ -772,7 +805,7 @@ function MemoryForm({ formData, setFormData, categories, onSubmit, onCancel }: M
       </div>
       <div className="flex justify-end gap-2 pt-2">
         <Button variant="outline" onClick={onCancel}>{t("common.cancel")}</Button>
-        <Button onClick={onSubmit} disabled={!formData.content.trim()}>
+        <Button onClick={onSubmit} disabled={isSaving || !formData.content.trim()}>
           <Save className="h-4 w-4 mr-2" />
           {t("common.save")}
         </Button>

@@ -30,6 +30,7 @@ from ...config import (
     get_memory_backend,
     get_memory_service_key,
     get_memory_service_url,
+    get_memory_similarity_threshold,
 )
 from ..execution_scope import (
     MEMORY_DIMENSION_METADATA_PREFIX,
@@ -53,6 +54,7 @@ logger = logging.getLogger(__name__)
 # writer never blinds cross-task recall by default. The key is stripped
 # before the request reaches the service.
 SCOPE_DIMENSIONS_FILTER_KEY = "__scope_dimensions__"
+READ_SCOPE_FILTER_KEY = "__memsrv_read_scope__"
 
 #: Read path timeout (方案 §3.3): the interactive path must fail fast rather
 #: than block the caller's event loop on a slow service.
@@ -196,27 +198,32 @@ def remote_upstream_report() -> tuple[str, str]:
 
     ``state`` is one of ``ready`` / ``degraded`` / ``unavailable``:
 
-    * ``ready`` -- the latest signal is an answered call below 500, or (with
+    * ``ready`` -- the latest signal is a successful 2xx call, or (with
       no call yet this process) a passing ``/readyz`` probe;
-    * ``degraded`` -- the latest signal is a 5xx answer, or a transport
+    * ``degraded`` -- the latest signal is a non-2xx answer, or a transport
       failure after the upstream had answered successfully before;
     * ``unavailable`` -- the upstream has never answered in this process and
       the latest signal is a failure.
 
-    The ``/readyz`` fallback is the probe ``remote_memory_ready`` already
+    The ``/readyz`` fallback is the probe ``remote_memory_readiness`` already
     caches (``READINESS_CACHE_SECONDS``), so this costs no extra traffic on
     repeated reads and never probes per memory request.
     """
     health = remote_upstream_health()
     event_kind = health["last_event_kind"]
     if event_kind is None:
-        available, reason = remote_memory_ready()
+        readiness = remote_memory_readiness()
         now = _format_event_time(time.time())
-        if available:
+        if readiness.status == "ready":
             return "ready", f"本进程尚无上游调用记录；/readyz 探测可达（{now}）"
+        if readiness.status == "degraded":
+            return (
+                "degraded",
+                f"本进程尚无上游调用记录；/readyz 功能降级（reason={readiness.reason}，{now}）",
+            )
         return (
             "unavailable",
-            f"本进程尚无上游调用记录；/readyz 探测不可达（reason={reason}，{now}）",
+            f"本进程尚无上游调用记录；/readyz 探测不可达（reason={readiness.reason}，{now}）",
         )
     if event_kind == "transport_error":
         detail = (
@@ -230,7 +237,7 @@ def remote_upstream_report() -> tuple[str, str]:
         return "degraded", detail
     status = health["last_status"]
     when = _format_event_time(health["last_event_at"])
-    if status is not None and status >= 500:
+    if status is None or not 200 <= status < 300:
         code = health["last_error_code"]
         code_note = f"（code={code}）" if code else ""
         return (
@@ -713,6 +720,13 @@ def _parse_timestamp(value: Any, *, fallback: datetime) -> datetime:
     return parsed
 
 
+class RemoteMemoryNote(MemoryNote):
+    """Server space fields, kept separate from application metadata."""
+
+    space_kind: Optional[str] = None
+    space_id: Optional[int] = None
+
+
 def _note_from_payload(data: Mapping[str, Any]) -> MemoryNote:
     """Rebuild a ``MemoryNote`` from the service's JSON representation.
 
@@ -745,7 +759,7 @@ def _note_from_payload(data: Mapping[str, Any]) -> MemoryNote:
             "Remote memory service returned a note without an id"
         )
 
-    return MemoryNote(
+    return RemoteMemoryNote(
         id=str(note_id),
         content=content,
         keywords=[str(item) for item in (data.get("keywords") or [])],
@@ -756,6 +770,8 @@ def _note_from_payload(data: Mapping[str, Any]) -> MemoryNote:
         ),
         mime_type=str(data.get("mime_type") or "text/plain"),
         metadata=metadata,
+        space_kind=data.get("space_kind"),
+        space_id=data.get("space_id"),
     )
 
 
@@ -1253,6 +1269,16 @@ class RemoteMemoryStore(MemoryStore):
             merged[SCOPE_EXCLUSIVE_FILTER_KEY] = True
         return merged
 
+    def _read_payload(self, filters: Optional[dict[str, Any]]) -> dict[str, Any]:
+        values = dict(filters or {})
+        scope = values.pop(READ_SCOPE_FILTER_KEY, None)
+        if scope is not None and scope not in {"owner", "visible", "org"}:
+            raise RemoteMemoryStoreError("Unsupported memory read scope")
+        result: dict[str, Any] = {"filters": self._filters_payload(values)}
+        if scope is not None:
+            result["scope"] = scope
+        return result
+
     def _scope_gates_by_id_access(self) -> bool:
         """Whether the active scope constrains by-id (get/update/delete).
 
@@ -1326,6 +1352,10 @@ class RemoteMemoryStore(MemoryStore):
             "mime_type": note.mime_type,
             "metadata": metadata,
         }
+        if isinstance(note, RemoteMemoryNote) and note.space_kind is not None:
+            payload["space_kind"] = note.space_kind
+            if note.space_id is not None:
+                payload["space_id"] = note.space_id
         if isinstance(note.content, bytes):
             payload["content_b64"] = base64.b64encode(note.content).decode("ascii")
         else:
@@ -1379,16 +1409,19 @@ class RemoteMemoryStore(MemoryStore):
         # Stamp the active scope's dimensions so scoped searches can filter on
         # them; the owner is set by the service, not stamped here (§3.2).
         self._stamp_note(note)
-        delivery = _parse_delivery_marker(note.content)
+        explicit_space = isinstance(note, RemoteMemoryNote)
+        delivery = None if explicit_space else _parse_delivery_marker(note.content)
         if self._access_scope is not None and (
-            delivery is not None or _parse_share_marker(note.content) is not None
+            delivery is not None
+            or (not explicit_space and _parse_share_marker(note.content) is not None)
+            or (isinstance(note, RemoteMemoryNote) and note.space_kind is not None)
         ):
             raise RemoteMemoryStoreError(
                 "Delivery/shared writes are unsupported in a fixed namespace"
             )
         if delivery is not None:
             return self._deliver(delivery[0], delivery[1], note)
-        share = _parse_share_marker(note.content)
+        share = None if explicit_space else _parse_share_marker(note.content)
         if share is not None:
             space_kind, space_id, stripped = share
             payload = self._note_payload(note, content_text=stripped)
@@ -1621,11 +1654,15 @@ class RemoteMemoryStore(MemoryStore):
         similarity_threshold: Optional[float] = None,
     ) -> List[MemoryNote]:
         path = "/v1/memory/search"
-        threshold = similarity_threshold
+        threshold = (
+            get_memory_similarity_threshold()
+            if similarity_threshold is None
+            else similarity_threshold
+        )
         body = {
+            **self._read_payload(filters),
             "query": query,
             "k": k,
-            "filters": self._filters_payload(filters),
             "similarity_threshold": threshold,
         }
         response = self._request("POST", path, body=body)
@@ -1636,9 +1673,7 @@ class RemoteMemoryStore(MemoryStore):
 
     def list_all(self, filters: Optional[dict[str, Any]] = None) -> List[MemoryNote]:
         path = "/v1/memory/list"
-        response = self._request(
-            "POST", path, body={"filters": self._filters_payload(filters)}
-        )
+        response = self._request("POST", path, body=self._read_payload(filters))
         self._raise_for_error(path, response)
         payload = self._json(path, response)
         # Completeness belongs to this endpoint's envelope. Search and inbox

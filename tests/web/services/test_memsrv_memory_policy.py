@@ -134,3 +134,55 @@ def test_unknown_backend_fences_admission_without_local_authority_read(
     assert status.state is memory_lifecycle.MemoryLifecycleState.RESTART_REQUIRED
     assert manager.acquire()[0] is None
     authority.assert_not_called()
+
+
+def test_sdk_uses_authenticated_owner_memory_without_changing_builder_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, readiness = _store(monkeypatch)
+    with UserContext(23):
+        policy = runtime.resolve_agent_service_memory_policy(
+            task=SimpleNamespace(
+                id=17, user_id=23, agent_id=41, source="sdk", agent_config={}
+            )
+        )
+    assert policy.memory is store
+    assert policy.memory_enabled
+    assert policy.memory_available
+    assert readiness.called
+
+
+@pytest.mark.parametrize("ambient", [None, 24])
+def test_sdk_owner_mismatch_fails_before_any_remote_probe(monkeypatch, ambient):
+    _store_obj, readiness = _store(monkeypatch)
+    with UserContext(ambient):
+        policy = runtime.resolve_agent_service_memory_policy(
+            task=SimpleNamespace(
+                id=17, user_id=23, agent_id=41, source="sdk", agent_config={}
+            )
+        )
+    assert not policy.memory_enabled
+    assert not policy.memory_available
+    readiness.assert_not_called()
+
+
+@pytest.mark.parametrize("preview", [False, True])
+def test_sdk_respects_explicit_host_denial_and_preview_default(monkeypatch, preview):
+    store, readiness = _store(monkeypatch)
+    if not preview:
+        set_trusted_memory_policy_resolver(
+            lambda _request: MemoryPolicyDecision(enabled=False, available=True)
+        )
+    with UserContext(23):
+        policy = runtime.resolve_agent_service_memory_policy(
+            task=SimpleNamespace(
+                id=17,
+                user_id=23,
+                agent_id=41,
+                source="sdk",
+                agent_config={"is_preview": preview},
+            )
+        )
+    assert not policy.memory_enabled
+    readiness.assert_not_called()
+    store.validate_identity_context.assert_not_called()

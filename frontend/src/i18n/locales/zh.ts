@@ -1706,6 +1706,7 @@ const zh = {
   },
   memory: {
     loading: "正在加载记忆...",
+    success: { created: "记忆已保存", updated: "记忆已更新" },
     header: {
       backTitle: "返回首页",
       title: "记忆中心",

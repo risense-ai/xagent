@@ -34,6 +34,7 @@ class ScriptedSession:
         self.calls: list[dict[str, Any]] = []
         self.status = 200
         self.payload: Any = {}
+        self.note_payload: Any = {"id": NOTE_ID, "content": "before"}
         self.failure: requests.exceptions.RequestException | None = None
 
     def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
@@ -46,7 +47,7 @@ class ScriptedSession:
         # the scripted receipt/error, rather than a fabricated complete note.
         if method == "GET" and "/notes/" in url:
             response.status_code = 200
-            payload: Any = {"id": NOTE_ID, "content": "before"}
+            payload: Any = self.note_payload
         else:
             response.status_code = self.status
             payload = self.payload
@@ -73,6 +74,80 @@ def remote_client() -> Iterator[tuple[TestClient, ScriptedSession]]:
     )
     with make_client(adapter) as client:
         yield client, session
+
+
+def test_space_and_read_scope_use_separate_wire_fields(remote_client):
+    client, session = remote_client
+    session.payload = {
+        "results": [
+            {
+                "id": "shared",
+                "content": "synthetic",
+                "space_kind": "company",
+                "space_id": None,
+            }
+        ],
+        "truncated": False,
+    }
+    response = client.get("/api/memory/list?space=company&scope=visible")
+    assert response.status_code == 200
+    assert session.calls[-1]["json"] == {
+        "scope": "visible",
+        "filters": {"space": "company"},
+    }
+    assert response.json()["filters_used"] == {"space": "company", "scope": "visible"}
+    assert response.json()["memories"][0]["space_kind"] == "company"
+
+
+def test_explicit_space_write_and_get_preserve_literal_content(remote_client):
+    client, session = remote_client
+    session.payload = {"id": NOTE_ID, "success": True}
+    text = "[share:company] is literal synthetic text"
+    created = client.post(
+        "/api/memory", json={"content": text, "space": "department", "space_id": 7}
+    )
+    assert created.status_code == 200
+    wire = session.calls[-1]
+    assert wire["url"].endswith("/v1/memory/notes")
+    assert wire["json"]["content"] == text
+    assert wire["json"]["space_kind"] == "department"
+    assert wire["json"]["space_id"] == 7
+    assert created.json()["space_kind"] == "department"
+    session.note_payload = {
+        "id": NOTE_ID,
+        "content": text,
+        "space_kind": "department",
+        "space_id": 7,
+    }
+    fetched = client.get(f"/api/memory/{quote(NOTE_ID, safe='')}")
+    assert fetched.status_code == 200
+    assert fetched.json()["space_id"] == 7
+    assert fetched.json()["content"] == text
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"space": "company", "space_kind": "department", "space_id": 1},
+        {"space": "department"},
+        {"space": "personal", "space_id": 1},
+        {"space": "department", "space_id": True},
+        {"space": "unsupported"},
+    ],
+)
+def test_invalid_or_conflicting_spaces_fail_before_http(remote_client, body):
+    client, session = remote_client
+    assert (
+        client.post("/api/memory", json={"content": "synthetic", **body}).status_code
+        == 400
+    )
+    assert session.calls == []
+
+
+def test_unsupported_space_id_filter_is_explicit(remote_client):
+    client, session = remote_client
+    assert client.get("/api/memory/list?space=department&space_id=7").status_code == 400
+    assert session.calls == []
 
 
 @pytest.mark.parametrize("truncated", [False, True, None, "false", 0])

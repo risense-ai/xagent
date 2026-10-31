@@ -3,26 +3,32 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Annotated, Any, Callable, Iterator, Optional
+from typing import Annotated, Any, Callable, Iterator, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from starlette import convertors as starlette_url  # codespell:ignore
 
-from xagent.core.memory.base import MemoryStore
-from xagent.core.memory.core import MemoryNote
-from xagent.core.memory.remote import RemoteMemoryStoreError
-
+from ...core.memory.base import MemoryStore
+from ...core.memory.core import MemoryNote
+from ...core.memory.remote import (
+    READ_SCOPE_FILTER_KEY,
+    RemoteMemoryNote,
+    RemoteMemoryStore,
+    RemoteMemoryStoreError,
+)
 from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store, get_memory_store_manager
 from ..memory_lifecycle import MemoryUnavailableError
 from ..models.user import User
+from ..revocable_memory_store import unwrap_memory_store
 from ..services.db_runtime import run_db_io_cancellation_safe
 from ..tracking.standalone_usage import usage_scope
 from ..user_isolated_memory import UserContext
 
 logger = logging.getLogger(__name__)
 MEMORY_READ_UNAVAILABLE_DETAIL = "Memory storage is temporarily unavailable."
+MEMORY_NOT_FOUND_DETAIL = "not found or not accessible"
 
 
 # Memory IDs are opaque strings. New notes get ``str(uuid.uuid4())``, but the
@@ -119,12 +125,22 @@ class MemoryListRequest(BaseModel):
 
 class MemoryUpdateRequest(BaseModel):
     content: Optional[str] = Field(None, description="Updated memory content")
+    space: Optional[str] = None
+    space_kind: Optional[str] = None
+    space_id: Optional[int] = None
     keywords: Optional[list[str]] = Field(None, description="Updated memory keywords")
     tags: Optional[list[str]] = Field(None, description="Updated memory tags")
     category: Optional[str] = Field(None, description="Updated memory category")
     metadata: Optional[dict[str, Any]] = Field(
         None, description="Updated memory metadata"
     )
+
+    @field_validator("content")
+    @classmethod
+    def reject_blank_content(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and not value.strip():
+            raise ValueError("Content must not be blank")
+        return value
 
 
 class MemoryListResponse(BaseModel):
@@ -195,8 +211,14 @@ class MemoryManagementRouter:
             search: Optional[str] = Query(
                 None, description="Search query to filter memories by content"
             ),
+            space: Optional[Literal["personal", "company", "department"]] = Query(None),
+            scope: Optional[Literal["owner", "visible", "org"]] = Query(None),
+            space_id: Optional[int] = Query(None, ge=1),
             similarity_threshold: Optional[float] = Query(
-                None, description="Similarity threshold for vector search (0.1-2.0)"
+                None,
+                ge=0.1,
+                le=2.0,
+                description="Similarity threshold for vector search (0.1-2.0)",
             ),
             limit: int = Query(
                 100, ge=1, le=1000, description="Maximum results to return"
@@ -209,6 +231,22 @@ class MemoryManagementRouter:
                 with UserContext(int(user.id)):
                     # Build filters
                     filters: dict[str, Any] = {}
+                    store = self.memory_store
+                    if space is not None or scope is not None or space_id is not None:
+                        if not isinstance(
+                            unwrap_memory_store(store), RemoteMemoryStore
+                        ):
+                            raise HTTPException(
+                                400,
+                                "Space/scope selection is unsupported by this memory backend",
+                            )
+                    if space_id is not None:
+                        raise HTTPException(
+                            400,
+                            "space_id filtering is not supported by the current memory service contract",
+                        )
+                    if space is not None:
+                        filters["space"] = space
                     if category:
                         filters["category"] = category
                     if tags:
@@ -224,6 +262,10 @@ class MemoryManagementRouter:
                     if date_to:
                         filters["date_to"] = date_to
 
+                    transport_filters = dict(filters)
+                    if scope is not None:
+                        transport_filters[READ_SCOPE_FILTER_KEY] = scope
+
                     try:
                         with memory_operation():
                             if search:
@@ -231,14 +273,14 @@ class MemoryManagementRouter:
                                 async with usage_scope(
                                     int(user.id), usage_source="memory_api"
                                 ):
-                                    memories = self.memory_store.search(
+                                    memories = store.search(
                                         query=search,
                                         k=1000,
-                                        filters=filters if filters else None,
+                                        filters=transport_filters or None,
                                         similarity_threshold=similarity_threshold,
                                     )
                             else:
-                                memories = self.memory_store.list_all(filters)
+                                memories = store.list_all(transport_filters)
                     except HTTPException:
                         raise
                     except Exception:
@@ -255,7 +297,7 @@ class MemoryManagementRouter:
                     # Convert to dict format for response
                     memory_dicts = []
                     for memory in memories:
-                        memory_dict = {
+                        memory_dict: dict[str, Any] = {
                             "id": memory.id,
                             "content": memory.content,
                             "keywords": memory.keywords,
@@ -265,12 +307,16 @@ class MemoryManagementRouter:
                             "mime_type": memory.mime_type,
                             "metadata": memory.metadata,
                         }
+                        if isinstance(memory, RemoteMemoryNote):
+                            memory_dict.update(
+                                space_kind=memory.space_kind, space_id=memory.space_id
+                            )
                         memory_dicts.append(memory_dict)
 
                     return MemoryListResponse(
                         memories=memory_dicts,
                         total_count=total_count,
-                        filters_used=filters,
+                        filters_used={**filters, **({"scope": scope} if scope else {})},
                     )
             except HTTPException:
                 raise
@@ -295,7 +341,7 @@ class MemoryManagementRouter:
                         }
                     else:
                         raise HTTPException(
-                            status_code=404, detail=response.error or "Memory not found"
+                            status_code=404, detail=MEMORY_NOT_FOUND_DETAIL
                         )
             except HTTPException:
                 raise
@@ -310,13 +356,19 @@ class MemoryManagementRouter:
             update_request: MemoryUpdateRequest,
             user: User = Depends(get_current_user),
         ) -> dict[str, Any]:
+            if {"space", "space_kind", "space_id"} & update_request.model_fields_set:
+                raise HTTPException(
+                    400, "Changing a memory's space is not supported by ordinary edits"
+                )
             try:
                 # Set user context for memory operations
                 with UserContext(int(user.id)), memory_operation():
                     # Get existing memory
                     get_response = self.memory_store.get(memory_id)
                     if not get_response.success:
-                        raise HTTPException(status_code=404, detail="Memory not found")
+                        raise HTTPException(
+                            status_code=404, detail=MEMORY_NOT_FOUND_DETAIL
+                        )
 
                     existing_memory = get_response.content
                     if not isinstance(existing_memory, MemoryNote):
@@ -391,22 +443,64 @@ class MemoryManagementRouter:
             memory_request: dict[str, Any], user: User = Depends(get_current_user)
         ) -> dict[str, Any]:
             # Validate required fields
-            if "content" not in memory_request:
-                raise HTTPException(status_code=422, detail="Content field is required")
+            content = memory_request.get("content")
+            if not isinstance(content, str) or not content.strip():
+                raise HTTPException(
+                    status_code=422, detail="Non-blank content is required"
+                )
             # Resolved before the try block on purpose: the lifecycle 503 must
             # reach the caller as itself, while the handler below keeps
             # wrapping store failures the way it always has.
             store = self.memory_store
+            remote = isinstance(unwrap_memory_store(store), RemoteMemoryStore)
+            if (
+                not remote
+                and {"space", "space_kind", "space_id"} & memory_request.keys()
+            ):
+                raise HTTPException(
+                    400, "Spaces are unsupported by this memory backend"
+                )
+            space = memory_request.get("space", "personal")
+            if not isinstance(space, str) or space not in {
+                "personal",
+                "company",
+                "department",
+            }:
+                raise HTTPException(400, "Unsupported memory space")
+            kind = None if space == "personal" else space
+            if "space_kind" in memory_request:
+                supplied = memory_request["space_kind"]
+                if supplied is not None and not isinstance(supplied, str):
+                    raise HTTPException(400, "Unsupported space_kind")
+                if "space" in memory_request and supplied != kind:
+                    raise HTTPException(400, "Conflicting space and space_kind")
+                if supplied not in {None, "company", "department"}:
+                    raise HTTPException(400, "Unsupported space_kind")
+                kind = supplied
+            space_id = memory_request.get("space_id")
+            if kind == "department":
+                if type(space_id) is not int or space_id <= 0:
+                    raise HTTPException(
+                        400, "A department space requires a positive integer space_id"
+                    )
+            elif space_id is not None:
+                raise HTTPException(
+                    400, "space_id is only valid for a department space"
+                )
             try:
                 # Set user context for memory operations
                 with UserContext(int(user.id)), memory_operation():
                     # Create new memory note
-                    memory_note = MemoryNote(
+                    note_type = RemoteMemoryNote if remote else MemoryNote
+                    memory_note = note_type(
                         content=memory_request.get("content", ""),
                         keywords=memory_request.get("keywords", []),
                         tags=memory_request.get("tags", []),
                         category=memory_request.get("category", "general"),
                         metadata=memory_request.get("metadata", {}),
+                        **(
+                            {"space_kind": kind, "space_id": space_id} if remote else {}
+                        ),
                     )
 
                     # Embeds the note.
@@ -417,6 +511,11 @@ class MemoryManagementRouter:
                             "success": True,
                             "memory_id": response.memory_id,
                             "message": "Memory created successfully",
+                            **(
+                                {"space_kind": kind, "space_id": space_id}
+                                if remote
+                                else {}
+                            ),
                         }
                     else:
                         raise HTTPException(
@@ -487,12 +586,20 @@ class MemoryManagementRouter:
                                 "timestamp": memory.timestamp,
                                 "mime_type": memory.mime_type,
                                 "metadata": memory.metadata,
+                                **(
+                                    {
+                                        "space_kind": memory.space_kind,
+                                        "space_id": memory.space_id,
+                                    }
+                                    if isinstance(memory, RemoteMemoryNote)
+                                    else {}
+                                ),
                             }
                         else:
                             return {"content": memory}
                     else:
                         raise HTTPException(
-                            status_code=404, detail=response.error or "Memory not found"
+                            status_code=404, detail=MEMORY_NOT_FOUND_DETAIL
                         )
             except HTTPException:
                 raise

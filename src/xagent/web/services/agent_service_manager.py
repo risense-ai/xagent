@@ -410,6 +410,12 @@ def resolve_agent_service_memory_policy(
     remote_health = None
     if isinstance(base_store, RemoteMemoryStore):
         try:
+            if (
+                source == "sdk"
+                and require_remote_memory_identity(_optional_task_int(task, "user_id"))
+                != require_remote_memory_identity()
+            ):
+                raise RemoteMemoryStoreIdentityError("memory_scope_owner_mismatch")
             base_store.validate_identity_context()
         except RemoteMemoryStoreIdentityError as error:
             return AgentServiceMemoryPolicy(

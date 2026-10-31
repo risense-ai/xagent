@@ -23,14 +23,17 @@ after it succeeds -- see :class:`AdmissionResult`.
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
-from ..config import get_memory_backend
+from ..config import (
+    DEFAULT_MEMORY_SIMILARITY_THRESHOLD,
+    get_memory_backend,
+    get_memory_similarity_threshold,
+)
 from ..core.memory import (
     DormantLanceDBMemoryHandle,
     MemoryStorageCapabilities,
@@ -74,7 +77,7 @@ logger = logging.getLogger(__name__)
 
 MEMORY_TABLE_NAME = "memories"
 AUTHORITY_CONFIG_ID = "global-memory-embedding-authority"
-DEFAULT_SIMILARITY_THRESHOLD = 1.5
+DEFAULT_SIMILARITY_THRESHOLD = DEFAULT_MEMORY_SIMILARITY_THRESHOLD
 
 EmbeddingFactory = Callable[[EmbeddingModelConfig], BaseEmbedding]
 
@@ -243,16 +246,7 @@ def log_operator_guidance(status: MemoryLifecycleStatus) -> None:
 
 
 def default_similarity_threshold() -> float:
-    configured = os.getenv("MEMORY_SIMILARITY_THRESHOLD")
-    if not configured:
-        return DEFAULT_SIMILARITY_THRESHOLD
-    try:
-        return float(configured)
-    except ValueError:
-        logger.warning(
-            "Ignoring unparsable MEMORY_SIMILARITY_THRESHOLD; using the default"
-        )
-        return DEFAULT_SIMILARITY_THRESHOLD
+    return get_memory_similarity_threshold()
 
 
 def memory_store_dir() -> str:
@@ -369,10 +363,15 @@ def remote_lifecycle_status(health: RemoteMemoryReadiness) -> MemoryLifecycleSta
 
 def resolve_remote_memory_policy(request: MemoryPolicyRequest) -> MemoryPolicyDecision:
     """Default remote eligibility; health is never an identity grant."""
-    if request.is_preview or request.agent_id is not None:
+    # SDK keys bind the top-level task to its owner; agent_id selects its
+    # executable configuration. AgentTool's delegated seat is a separate,
+    # explicitly verified identity and must never be inferred from this id.
+    if request.is_preview or (request.agent_id is not None and request.source != "sdk"):
         return MemoryPolicyDecision(enabled=False, available=True)
     try:
-        require_remote_memory_identity(request.user_id)
+        expected = require_remote_memory_identity(request.user_id)
+        if expected != require_remote_memory_identity():
+            raise RemoteMemoryStoreIdentityError("memory_scope_owner_mismatch")
         # Validate the active scope as well as the request projection before
         # readiness I/O. In particular, a previously revoked scope stays closed.
         from .dynamic_memory_store import get_memory_store
